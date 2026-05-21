@@ -283,6 +283,11 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
     fn tracker(&self) -> Option<std::sync::Arc<common::timing::RequestTracker>> {
         None
     }
+
+    /// Model name for per-request metrics and logging.
+    fn model_name(&self) -> &str {
+        "unknown"
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -41,6 +41,7 @@ For detailed setup instructions and configuration, see [Prometheus + Grafana Set
 | [Health Checks](health-checks.md) | Component health monitoring and readiness probes | `DYN_SYSTEM_PORT`†, `DYN_SYSTEM_STARTING_HEALTH_STATUS`, `DYN_SYSTEM_HEALTH_PATH`, `DYN_SYSTEM_LIVE_PATH`, `DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS` |
 | [Tracing](tracing.md) | Distributed tracing with OpenTelemetry and Tempo | `DYN_LOGGING_JSONL`†, `OTEL_EXPORT_ENABLED`†, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`†, `OTEL_SERVICE_NAME`† |
 | [Logging](logging.md) | Structured logging and OTLP log export to Loki | `DYN_LOGGING_JSONL`†, `DYN_LOG`, `DYN_LOG_USE_LOCAL_TZ`, `DYN_LOGGING_CONFIG_PATH`, `OTEL_SERVICE_NAME`†, `OTEL_EXPORT_ENABLED`†, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`†, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`† |
+| [Per-Request Metrics](request-metrics.md) | Async JSONL per-request metrics (tokens, TTFT, KV hit, worker) | `DYN_REQUEST_METRICS_ENABLED`, `DYN_REQUEST_METRICS_SINKS`, `DYN_REQUEST_METRICS_FILE`, `DYN_REQUEST_METRICS_CAPACITY` |
 
 **Variables marked with † are shared across multiple observability systems.**
 

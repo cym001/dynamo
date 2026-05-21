@@ -105,8 +105,11 @@ pub struct RequestTracker {
     /// record the final finish time.
     request_finish_time: Mutex<Option<Instant>>,
 
-    /// KV cache overlap blocks (prefix cache hits) - set once via OnceLock
+    /// KV cache overlap blocks on the selected worker - set once via OnceLock
     kv_overlap_blocks: OnceLock<u32>,
+
+    /// Maximum KV cache overlap blocks across all workers at routing time - set once via OnceLock
+    max_kv_overlap_blocks: OnceLock<u32>,
 
     /// Input sequence length in blocks (for hit rate calculation) - set once via OnceLock
     isl_blocks: OnceLock<usize>,
@@ -186,6 +189,7 @@ impl RequestTracker {
             decode_first_token_time: OnceLock::new(),
             request_finish_time: Mutex::new(None),
             kv_overlap_blocks: OnceLock::new(),
+            max_kv_overlap_blocks: OnceLock::new(),
             isl_blocks: OnceLock::new(),
             isl_tokens: OnceLock::new(),
             cached_tokens: OnceLock::new(),
@@ -304,7 +308,18 @@ impl RequestTracker {
         self.request_received_epoch_ms
     }
 
-    /// KV cache hit rate as a ratio (0.0 to 1.0).
+    /// Record maximum KV cache overlap across all workers at routing time.
+    /// Returns true if this was the first call.
+    pub fn record_max_kv_hit(&self, max_overlap_blocks: u32, isl_blocks: usize) -> bool {
+        if self.isl_blocks.get().is_none() {
+            let _ = self.isl_blocks.set(isl_blocks);
+        }
+        self.max_kv_overlap_blocks.set(max_overlap_blocks).is_ok()
+    }
+
+    /// KV cache hit rate on the selected worker as a ratio (0.0 to 1.0).
+    ///
+    /// This is the router's predicted hit rate at routing time, not engine-measured prefix cache.
     pub fn kv_hit_rate(&self) -> Option<f64> {
         let overlap = *self.kv_overlap_blocks.get()?;
         let isl = *self.isl_blocks.get()?;
@@ -312,6 +327,16 @@ impl RequestTracker {
             return None;
         }
         Some(overlap as f64 / isl as f64)
+    }
+
+    /// Maximum KV cache hit rate across all workers at routing time (0.0 to 1.0).
+    pub fn max_kv_hit_rate(&self) -> Option<f64> {
+        let max_overlap = *self.max_kv_overlap_blocks.get()?;
+        let isl = *self.isl_blocks.get()?;
+        if isl == 0 {
+            return None;
+        }
+        Some(max_overlap as f64 / isl as f64)
     }
 
     /// Set the request phase and return a permit that blocks subsequent phase changes.
@@ -631,7 +656,7 @@ pub struct TimingInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_time_ms: Option<f64>,
 
-    /// KV cache hit rate (0.0 to 1.0) - ratio of cached blocks to total input blocks
+    /// KV cache hit rate on the selected worker (0.0 to 1.0) - router-predicted at routing time
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_hit_rate: Option<f64>,
 
@@ -724,6 +749,26 @@ mod tests {
             tracker.kv_hit_rate().is_none(),
             "KV hit rate should be None when isl_blocks is 0"
         );
+    }
+
+    #[test]
+    fn test_max_kv_hit_rate() {
+        let tracker = RequestTracker::new();
+        tracker.record_kv_hit(3, 10);
+        tracker.record_max_kv_hit(7, 10);
+
+        let rate = tracker.max_kv_hit_rate().unwrap();
+        assert!(
+            (rate - 0.7).abs() < f64::EPSILON,
+            "max KV hit rate should be 0.7, got {rate}"
+        );
+    }
+
+    #[test]
+    fn test_max_kv_hit_rate_zero_isl() {
+        let tracker = RequestTracker::new();
+        tracker.record_max_kv_hit(0, 0);
+        assert!(tracker.max_kv_hit_rate().is_none());
     }
 
     #[test]

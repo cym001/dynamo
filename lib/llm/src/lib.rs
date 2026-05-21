@@ -23,6 +23,7 @@ pub mod hub;
 // pub mod key_value_store;
 pub mod audit;
 pub mod kv_router;
+pub mod request_metrics;
 pub mod local_model;
 pub mod lora;
 pub mod migration;

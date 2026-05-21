@@ -41,12 +41,13 @@ pub struct KvPushRouter {
     agent_controller: Arc<AgentController>,
 }
 
-/// Result of worker selection containing instance ID, dp_rank, and overlap amount.
+/// Result of worker selection containing instance ID, dp_rank, and overlap amounts.
 struct WorkerSelection {
     instance_id: u64,
     backend_dp_rank: Option<u32>,
     bookkeeping_dp_rank: Option<u32>,
     overlap_amount: Option<u32>,
+    max_overlap_amount: Option<u32>,
 }
 
 fn pinned_worker_hint(
@@ -309,7 +310,7 @@ impl KvPushRouter {
         let (routing_token_ids, block_mm_infos) = request.block_mm_routing_info();
         let Some((pinned_worker_id, requested_dp_rank)) = pinned_worker_hint(phase, routing) else {
             let _nvtx_kv = dynamo_nvtx_range!("route.kv_match");
-            let (best_worker, overlap_amount) = self
+            let (best_worker, overlap_amount, max_overlap_amount) = self
                 .chooser
                 .find_best_match(
                     Some(context_id),
@@ -351,6 +352,7 @@ impl KvPushRouter {
                 backend_dp_rank: Some(best_worker.dp_rank),
                 bookkeeping_dp_rank: Some(best_worker.dp_rank),
                 overlap_amount: Some(overlap_amount),
+                max_overlap_amount: Some(max_overlap_amount),
             });
         };
 
@@ -359,7 +361,7 @@ impl KvPushRouter {
             .map(|dp_rank| WorkerWithDpRank::new(pinned_worker_id, dp_rank));
 
         if !is_query_only && let Some(pinned_worker) = resolved_pinned_worker {
-            let (best_worker, overlap_amount) = self
+            let (best_worker, overlap_amount, max_overlap_amount) = self
                 .chooser
                 .find_best_match(
                     Some(context_id),
@@ -380,6 +382,7 @@ impl KvPushRouter {
                 backend_dp_rank: Some(best_worker.dp_rank),
                 bookkeeping_dp_rank: Some(best_worker.dp_rank),
                 overlap_amount: Some(overlap_amount),
+                max_overlap_amount: Some(max_overlap_amount),
             });
         }
 
@@ -392,56 +395,62 @@ impl KvPushRouter {
             "Routing to specified worker"
         );
 
-        let (bookkeeping_dp_rank, overlap_amount) = if let Some(dp_rank) = backend_dp_rank {
-            let worker = WorkerWithDpRank::new(pinned_worker_id, dp_rank);
-            let overlap_blocks = self
-                .chooser
-                .get_overlap_blocks(
-                    routing_token_ids,
-                    block_mm_infos,
-                    worker,
-                    lora_name.as_deref(),
-                )
-                .await?;
-
-            if !is_query_only {
-                self.chooser
-                    .add_request(
-                        context_id.to_string(),
+        let (bookkeeping_dp_rank, overlap_amount, max_overlap_amount) =
+            if let Some(dp_rank) = backend_dp_rank {
+                let worker = WorkerWithDpRank::new(pinned_worker_id, dp_rank);
+                let (overlap_blocks, max_overlap_blocks) = self
+                    .chooser
+                    .get_worker_and_max_overlap(
                         routing_token_ids,
                         block_mm_infos,
-                        overlap_blocks,
-                        expected_output_tokens,
                         worker,
-                        lora_name,
-                        request.router_config_override.as_ref(),
+                        lora_name.as_deref(),
                     )
-                    .await;
+                    .await?;
+
+                if !is_query_only {
+                    self.chooser
+                        .add_request(
+                            context_id.to_string(),
+                            routing_token_ids,
+                            block_mm_infos,
+                            overlap_blocks,
+                            expected_output_tokens,
+                            worker,
+                            lora_name,
+                            request.router_config_override.as_ref(),
+                        )
+                        .await;
+                } else {
+                    tracing::debug!(
+                        request_id = %context_id,
+                        worker_id = pinned_worker_id,
+                        dp_rank = dp_rank,
+                        "Skipping add_request - query-only request"
+                    );
+                }
+
+                (
+                    Some(dp_rank),
+                    Some(overlap_blocks),
+                    Some(max_overlap_blocks),
+                )
             } else {
                 tracing::debug!(
                     request_id = %context_id,
                     worker_id = pinned_worker_id,
-                    dp_rank = dp_rank,
-                    "Skipping add_request - query-only request"
+                    ?phase,
+                    "Routing to specified worker without resolved dp_rank; skipping scheduler bookkeeping"
                 );
-            }
-
-            (Some(dp_rank), Some(overlap_blocks))
-        } else {
-            tracing::debug!(
-                request_id = %context_id,
-                worker_id = pinned_worker_id,
-                ?phase,
-                "Routing to specified worker without resolved dp_rank; skipping scheduler bookkeeping"
-            );
-            (None, None)
-        };
+                (None, None, None)
+            };
 
         Ok(WorkerSelection {
             instance_id: pinned_worker_id,
             backend_dp_rank,
             bookkeeping_dp_rank,
             overlap_amount,
+            max_overlap_amount,
         })
     }
 }
@@ -514,6 +523,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             backend_dp_rank,
             bookkeeping_dp_rank,
             overlap_amount,
+            max_overlap_amount,
         } = selection;
         let scheduler_tracked = !is_query_only && bookkeeping_dp_rank.is_some();
 
@@ -564,6 +574,9 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             let isl_blocks = routing_token_ids.len().div_ceil(block_size);
             if let Some(overlap_amount) = overlap_amount {
                 tracker.record_kv_hit(overlap_amount, isl_blocks);
+            }
+            if let Some(max_overlap_amount) = max_overlap_amount {
+                tracker.record_max_kv_hit(max_overlap_amount, isl_blocks);
             }
             tracker.record_isl(
                 routing_token_ids.len(),

@@ -299,7 +299,7 @@ def setup_kv_event_publisher(
 ) -> Optional[list[KvEventPublisher]]:
     """
     list[KvEventPublisher] | None
-    Set up KV event publishers for prefix caching if enabled.
+    Set up KV event publishers for vLLM or external KV event sources.
     Creates one publisher per dp_rank since each dp_rank publishes to a different port.
     Args:
         config: Worker configuration
@@ -309,21 +309,20 @@ def setup_kv_event_publisher(
         consolidator_port: Port where kv event consolidator publishes (default: 5558)
 
     Returns:
-        List of KvEventPublisher instances (one per dp_rank) if prefix caching is enabled, None otherwise.
+        List of KvEventPublisher instances (one per dp_rank) if KV events are enabled, None otherwise.
     """
-    if not config.engine_args.enable_prefix_caching:
-        return None
-
     # Skip KV event publishing for decode workers
     if config.disaggregation_mode == DisaggregationMode.DECODE:
         logger.info("Skipping KV event publisher setup for decode worker")
         return None
 
-    if config.engine_args.kv_events_config is None:
+    kv_events_config = config.engine_args.kv_events_config
+    if kv_events_config is None:
+        logger.info("KV event publisher setup skipped: no kv_events_config configured")
         return None
 
     # Check if kv_cache_events are explicitly disabled
-    if not config.engine_args.kv_events_config.enable_kv_cache_events:
+    if not kv_events_config.enable_kv_cache_events:
         logger.info(
             "KV event publishing skipped: enable_kv_cache_events=False in kv_events_config"
         )
@@ -344,7 +343,7 @@ def setup_kv_event_publisher(
         else:
             # Each dp_rank publishes to a different port
             zmq_endpoint = ZmqEventPublisher.offset_endpoint_port(
-                config.engine_args.kv_events_config.endpoint,
+                kv_events_config.endpoint,
                 data_parallel_rank=dp_rank,
             ).replace("*", "127.0.0.1")
             logger.info(
@@ -355,7 +354,7 @@ def setup_kv_event_publisher(
             endpoint=generate_endpoint,
             kv_block_size=vllm_config.cache_config.block_size,
             zmq_endpoint=zmq_endpoint,
-            zmq_topic="",
+            zmq_topic=getattr(kv_events_config, "topic", "") or "",
             enable_local_indexer=config.enable_local_indexer,
             dp_rank=dp_rank,
         )

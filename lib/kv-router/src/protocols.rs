@@ -763,6 +763,11 @@ impl OverlapScores {
         }
     }
 
+    /// Maximum overlap blocks across all workers in this match result.
+    pub fn max_overlap_blocks(&self) -> u32 {
+        self.scores.values().copied().max().unwrap_or(0)
+    }
+
     /// Update the scores with a set of workers.
     ///
     /// ### Arguments
@@ -962,6 +967,19 @@ mod tests {
     fn test_overlap_scores_default() {
         let overlap_scores: OverlapScores = Default::default();
         assert!(overlap_scores.scores.is_empty());
+        assert_eq!(overlap_scores.max_overlap_blocks(), 0);
+    }
+
+    #[test]
+    fn test_overlap_scores_max_overlap_blocks() {
+        let mut overlap_scores = OverlapScores::new();
+        overlap_scores
+            .scores
+            .insert(WorkerWithDpRank::new(1, 0), 3);
+        overlap_scores
+            .scores
+            .insert(WorkerWithDpRank::new(2, 0), 7);
+        assert_eq!(overlap_scores.max_overlap_blocks(), 7);
     }
 
     #[rstest]

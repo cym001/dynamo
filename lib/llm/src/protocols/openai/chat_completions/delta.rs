@@ -432,6 +432,11 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         let timing_info: Option<TimingInfo> = if finish_reason.is_some() {
             self.tracker.as_ref().map(|tracker| {
                 tracker.record_finish();
+                crate::request_metrics::publish_from_tracker(
+                    tracker,
+                    &self.id,
+                    &self.model,
+                );
                 tracker.get_timing_info()
             })
         } else {
@@ -494,6 +499,10 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
     fn tracker(&self) -> Option<std::sync::Arc<crate::protocols::common::timing::RequestTracker>> {
         self.tracker.clone()
+    }
+
+    fn model_name(&self) -> &str {
+        &self.model
     }
 }
 

@@ -109,6 +109,16 @@ pub async fn run_input(
         tracing::info!(cap, "Audit initialized");
     }
 
+    if crate::request_metrics::enabled() {
+        let cap: usize = std::env::var("DYN_REQUEST_METRICS_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        crate::request_metrics::init_bus(cap);
+        crate::request_metrics::sink::spawn_workers_from_env().await?;
+        tracing::info!(cap, "Request metrics initialized");
+    }
+
     match in_opt {
         Input::Http => {
             http::run(drt, engine_config).await?;

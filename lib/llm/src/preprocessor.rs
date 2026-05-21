@@ -1019,6 +1019,11 @@ impl OpenAIPreprocessor {
                                 DETOKENIZE_TOTAL_US.inc_by(total.as_micros() as f64);
                             }
                             DETOKENIZE_TOKEN_COUNT.inc_by(t.detokenize_count() as f64);
+                            crate::request_metrics::publish_from_tracker(
+                                t,
+                                inner.context.id(),
+                                inner.response_generator.model_name(),
+                            );
                         }
 
                         // Create annotation string
