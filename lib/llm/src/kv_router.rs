@@ -376,7 +376,7 @@ impl KvRouter {
         lora_name: Option<String>,
         priority_jump: f64,
         allowed_worker_ids: Option<HashSet<WorkerId>>,
-    ) -> anyhow::Result<(WorkerWithDpRank, u32)> {
+    ) -> anyhow::Result<(WorkerWithDpRank, u32, u32)> {
         let start = Instant::now();
 
         if update_states && context_id.is_none() {
@@ -400,6 +400,7 @@ impl KvRouter {
             .find_matches(block_hashes)
             .instrument(tracing::info_span!("kv_router.find_matches"))
             .await?;
+        let max_overlap_blocks = overlap_scores.max_overlap_blocks();
         let find_matches_elapsed = start.elapsed();
 
         // Compute seq_hashes only if scheduler needs it for active blocks tracking
@@ -450,7 +451,11 @@ impl KvRouter {
             "find_best_match completed"
         );
 
-        Ok((response.best_worker, response.overlap_blocks))
+        Ok((
+            response.best_worker,
+            response.overlap_blocks,
+            max_overlap_blocks,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -524,9 +529,25 @@ impl KvRouter {
         worker: WorkerWithDpRank,
         lora_name: Option<&str>,
     ) -> Result<u32, KvRouterError> {
-        let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, None, lora_name);
+        let (overlap, _) = self
+            .get_worker_and_max_overlap(tokens, None, worker, lora_name)
+            .await?;
+        Ok(overlap)
+    }
+
+    /// Overlap on the given worker and maximum overlap across all workers.
+    pub async fn get_worker_and_max_overlap(
+        &self,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        worker: WorkerWithDpRank,
+        lora_name: Option<&str>,
+    ) -> Result<(u32, u32), KvRouterError> {
+        let block_hashes =
+            compute_block_hash_for_seq(tokens, self.block_size, block_mm_infos, lora_name);
         let overlap_scores = self.indexer.find_matches(block_hashes).await?;
-        Ok(overlap_scores.scores.get(&worker).copied().unwrap_or(0))
+        let overlap = overlap_scores.scores.get(&worker).copied().unwrap_or(0);
+        Ok((overlap, overlap_scores.max_overlap_blocks()))
     }
 
     /// Get potential prefill and decode loads for all workers
@@ -574,7 +595,7 @@ impl AsyncEngine<SingleIn<RouterRequest>, ManyOut<Annotated<RouterResponse>>, Er
                 tokens,
                 block_mm_infos,
             } => {
-                let (best_worker, overlap_blocks) = self
+                let (best_worker, overlap_blocks, _) = self
                     .find_best_match(
                         Some(&context_id),
                         &tokens,

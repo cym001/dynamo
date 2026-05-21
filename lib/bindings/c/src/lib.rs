@@ -496,6 +496,7 @@ impl RouterHandles {
                 allowed_worker_ids,
             )
             .await
+            .map(|(worker, overlap, _max_overlap)| (worker, overlap))
             .map_err(|e| {
                 tracing::error!(error = ?e, "Decode query failed");
                 QueryRouterResult::ErrQueryFailed

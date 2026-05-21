@@ -273,7 +273,7 @@ def update_engine_config_with_dynamo(
 def create_kv_events_config(
     dynamo_config: Config, engine_config: AsyncEngineArgs
 ) -> Optional[KVEventsConfig]:
-    """Create KVEventsConfig for prefix caching if needed."""
+    """Create KVEventsConfig for vLLM or external KV event sources."""
     if dynamo_config.disaggregation_mode == DisaggregationMode.DECODE:
         logger.info(
             "Decode worker detected (disaggregation_mode=decode): "
@@ -281,20 +281,31 @@ def create_kv_events_config(
         )
         return None
 
-    # If prefix caching is not enabled, no events config needed
-    if not engine_config.enable_prefix_caching:
-        logger.info("No kv_events_config required: prefix caching is disabled")
-        return None
-
-    # If user provided their own config, use that
-    if c := getattr(engine_config, "kv_events_config"):
+    # If user provided their own config, use that even when vLLM prefix caching
+    # is disabled. External KV providers such as LMCache can still generate
+    # cache events for Dynamo's KV-aware router.
+    if (c := getattr(engine_config, "kv_events_config", None)) is not None:
         if not c.enable_kv_cache_events:
             logger.warning(
                 "User provided --kv_events_config which set enable_kv_cache_events to False (default). "
                 "To publish events, explicitly set enable_kv_cache_events to True."
             )
+        elif not engine_config.enable_prefix_caching:
+            logger.info(
+                "Using user-provided kv_events_config with prefix caching disabled "
+                "for an external KV event source"
+            )
         logger.info(f"Using user-provided kv_events_config {c}")
         return c
+
+    # If prefix caching is not enabled and the user did not provide an external
+    # events config, no events config is needed.
+    if not engine_config.enable_prefix_caching:
+        logger.info(
+            "No kv_events_config required: prefix caching is disabled and no "
+            "user-provided kv_events_config was supplied"
+        )
+        return None
 
     # Create default events config for prefix caching
     # TODO: move this to configuration system.

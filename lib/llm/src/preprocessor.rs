@@ -913,6 +913,14 @@ impl OpenAIPreprocessor {
                             detokenize_count: tracker.as_ref().map(|t| t.detokenize_count()),
                         };
 
+                        if let Some(tracker) = tracker.as_ref() {
+                            crate::request_metrics::publish_from_tracker(
+                                tracker,
+                                inner.context.id(),
+                                &inner.response_generator.model,
+                            );
+                        }
+
                         // Create annotation string
                         let annotation = llm_metrics.to_annotation::<()>().unwrap_or_else(|e| {
                             tracing::warn!("Failed to serialize metrics: {}", e);

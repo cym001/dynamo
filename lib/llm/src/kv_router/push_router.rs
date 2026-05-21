@@ -33,11 +33,12 @@ pub struct KvPushRouter {
     pub chooser: Arc<KvRouter>,
 }
 
-/// Result of worker selection containing instance ID, dp_rank, and overlap amount.
+/// Result of worker selection containing instance ID, dp_rank, and overlap amounts.
 struct WorkerSelection {
     instance_id: u64,
     dp_rank: u32,
     overlap_amount: u32,
+    max_overlap_amount: u32,
 }
 
 /// Drop guard that manages the full lifecycle of a routed request:
@@ -215,7 +216,7 @@ impl KvPushRouter {
         };
 
         let Some(id) = preselected_id else {
-            let (best_worker, overlap_amount) = self
+            let (best_worker, overlap_amount, max_overlap_amount) = self
                 .chooser
                 .find_best_match(
                     Some(context_id),
@@ -254,6 +255,7 @@ impl KvPushRouter {
                 instance_id: best_worker.worker_id,
                 dp_rank: best_worker.dp_rank,
                 overlap_amount,
+                max_overlap_amount,
             });
         };
 
@@ -265,9 +267,14 @@ impl KvPushRouter {
         );
 
         let worker = WorkerWithDpRank::new(id, dp_rank);
-        let overlap_blocks = self
+        let (overlap_blocks, max_overlap_blocks) = self
             .chooser
-            .get_overlap_blocks(routing_token_ids, worker, lora_name.as_deref())
+            .get_worker_and_max_overlap(
+                routing_token_ids,
+                block_mm_infos,
+                worker,
+                lora_name.as_deref(),
+            )
             .await?;
 
         if !is_query_only {
@@ -295,6 +302,7 @@ impl KvPushRouter {
             instance_id: id,
             dp_rank,
             overlap_amount: overlap_blocks,
+            max_overlap_amount: max_overlap_blocks,
         })
     }
 }
@@ -348,6 +356,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             instance_id,
             dp_rank,
             overlap_amount,
+            max_overlap_amount,
         } = selection;
 
         // In approximate mode (use_kv_events=false), record the routing decision
@@ -380,6 +389,7 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             let (routing_token_ids, _) = request.block_mm_routing_info();
             let isl_blocks = routing_token_ids.len().div_ceil(block_size);
             tracker.record_kv_hit(overlap_amount, isl_blocks);
+            tracker.record_max_kv_hit(max_overlap_amount, isl_blocks);
             tracker.record_isl(
                 routing_token_ids.len(),
                 overlap_amount as usize * block_size,
