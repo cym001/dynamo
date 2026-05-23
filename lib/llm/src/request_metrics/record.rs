@@ -80,7 +80,7 @@ mod tests {
     #[test]
     fn test_from_tracker_with_kv_metrics() {
         let tracker = RequestTracker::new();
-        tracker.record_isl(100, 30);
+        tracker.record_isl(100, Some(30));
         tracker.record_kv_hit(3, 10);
         tracker.record_max_kv_hit(7, 10);
         tracker.record_osl(50);
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn test_from_tracker_without_kv_metrics() {
         let tracker = RequestTracker::new();
-        tracker.record_isl(64, 0);
+        tracker.record_isl(64, Some(0));
 
         let rec = RequestMetricsRecord::from_tracker(&tracker, "req-2", "m", None, false);
 

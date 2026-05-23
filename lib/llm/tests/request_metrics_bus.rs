@@ -11,7 +11,7 @@ static INIT: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     INIT.get_or_init(|| {
-        std::env::set_var("DYN_REQUEST_METRICS_ENABLED", "true");
+        unsafe { std::env::set_var("DYN_REQUEST_METRICS_ENABLED", "true") };
         init_bus(8);
     });
 }
@@ -23,7 +23,7 @@ async fn test_request_metrics_bus_publish() {
     let mut rx = dynamo_llm::request_metrics::bus::subscribe();
 
     let tracker = RequestTracker::new();
-    tracker.record_isl(100, 30);
+    tracker.record_isl(100, Some(30));
     tracker.record_kv_hit(3, 10);
     tracker.record_max_kv_hit(7, 10);
     tracker.record_osl(42);
