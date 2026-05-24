@@ -1682,7 +1682,9 @@ mod batching_state_tests {
 #[cfg(test)]
 mod event_processor_tests {
     use super::*;
+    use dynamo_kv_router::protocols::{DYN_CPU_KV_EVENTS_ONLY, StorageTier};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     /// Mock publisher that collects published events
@@ -2718,6 +2720,68 @@ mod event_processor_tests {
             );
         } else {
             panic!("Expected Stored event");
+        }
+    }
+
+    fn local_cpu_event(event: KvCacheEvent) -> PlacementEvent {
+        PlacementEvent::new(
+            Placement::local_worker(1, event.dp_rank, StorageTier::HostPinned),
+            event,
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_run_event_processor_cpu_only_mode_filters_gpu_events() {
+        unsafe {
+            std::env::set_var(DYN_CPU_KV_EVENTS_ONLY, "true");
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel::<PlacementEvent>();
+        let publisher = MockPublisher::new();
+        let publisher_clone = publisher.clone();
+        let cancellation_token = CancellationToken::new();
+
+        let handle = tokio::spawn(async move {
+            run_event_processor_loop(
+                publisher_clone,
+                1,
+                cancellation_token,
+                rx,
+                None,
+                Some(1),
+                DEFAULT_MAX_BATCH_BLOCKS,
+            )
+            .await
+        });
+
+        tx.send(local_gpu_event(KvCacheEvent {
+            event_id: 1,
+            data: KvCacheEventData::Removed(KvCacheRemoveData {
+                block_hashes: vec![ExternalSequenceBlockHash(1)],
+            }),
+            dp_rank: 0,
+        }))
+        .unwrap();
+        tx.send(local_cpu_event(KvCacheEvent {
+            event_id: 2,
+            data: KvCacheEventData::Removed(KvCacheRemoveData {
+                block_hashes: vec![ExternalSequenceBlockHash(2)],
+            }),
+            dp_rank: 0,
+        }))
+        .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        drop(tx);
+        handle.await.unwrap();
+
+        let events = publisher.get_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].storage_tier, StorageTier::HostPinned);
+
+        unsafe {
+            std::env::remove_var(DYN_CPU_KV_EVENTS_ONLY);
         }
     }
 }

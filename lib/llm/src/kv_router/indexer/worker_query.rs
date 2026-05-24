@@ -25,7 +25,7 @@ use super::Indexer;
 use crate::kv_router::worker_kv_indexer_query_endpoint;
 use dynamo_kv_router::{
     indexer::{LocalKvIndexer, WorkerKvQueryRequest, WorkerKvQueryResponse},
-    protocols::{DpRank, KvCacheEventData, RouterEvent, WorkerId},
+    protocols::{DpRank, KvCacheEventData, KvEventTierMode, RouterEvent, WorkerId},
     recovery::{CursorObservation, CursorState},
 };
 
@@ -165,6 +165,7 @@ pub struct WorkerQueryClient {
     transport: Arc<dyn WorkerQueryTransport>,
     /// Indexer for applying recovered events and worker removals.
     indexer: Indexer,
+    tier_mode: KvEventTierMode,
     worker_states: DashMap<WorkerId, Arc<Mutex<WorkerState>>>,
     recovery_semaphore: Arc<Semaphore>,
 }
@@ -179,6 +180,7 @@ impl WorkerQueryClient {
             component,
             transport,
             indexer,
+            tier_mode: KvEventTierMode::from_env(),
             worker_states: DashMap::new(),
             recovery_semaphore: Arc::new(Semaphore::new(RECOVERY_CONCURRENCY_LIMIT)),
         })
@@ -361,11 +363,24 @@ impl WorkerQueryClient {
     ) {
         self.indexer.remove_worker_dp_rank(worker_id, dp_rank).await;
         for event in events {
-            self.indexer.apply_event(event).await;
+            if self.tier_mode.accepts_router_event(&event) {
+                self.indexer.apply_event(event).await;
+            }
         }
     }
 
     pub(crate) async fn handle_live_event(self: &Arc<Self>, event: RouterEvent) {
+        if !self.tier_mode.accepts_router_event(&event) {
+            tracing::trace!(
+                worker_id = event.worker_id,
+                dp_rank = event.event.dp_rank,
+                event_id = event.event.event_id,
+                storage_tier = ?event.storage_tier,
+                "Skipping live router event due to tier filter"
+            );
+            return;
+        }
+
         let worker_id = event.worker_id;
         let dp_rank = event.event.dp_rank;
         let event_id = event.event.event_id;
@@ -519,6 +534,9 @@ impl WorkerQueryClient {
                 );
                 for event in events {
                     let event_id = event.event.event_id;
+                    if !self.tier_mode.accepts_router_event(&event) {
+                        continue;
+                    }
                     if matches!(&event.event.data, KvCacheEventData::Cleared) {
                         self.apply_worker_clear_locked(&mut worker_state, event)
                             .await;

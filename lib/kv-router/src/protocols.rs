@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::env;
 use std::future::Future;
 use std::time::Duration;
 
@@ -229,9 +230,17 @@ pub enum StorageTier {
 
 impl StorageTier {
     pub fn from_kv_medium(medium: &str) -> Option<Self> {
-        match medium {
+        let normalized = medium.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        let upper = normalized.to_ascii_uppercase();
+        if upper == "CUDA" || upper.starts_with("CUDA:") || upper.starts_with("CUDA_") {
+            return Some(Self::Device);
+        }
+        match upper.as_str() {
             "GPU" | "DEVICE" => Some(Self::Device),
-            "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
+            "CPU" | "CPU_PINNED" | "CPU_TIER1" => Some(Self::HostPinned),
             "CPU_TIER2" | "DISK" | "NVME" => Some(Self::Disk),
             "EXTERNAL" | "NETWORK" | "REMOTE" | "SHARED" => Some(Self::External),
             _ => None,
@@ -275,6 +284,40 @@ impl Placement {
 
     pub fn is_local_gpu(&self) -> bool {
         matches!(self.owner, PlacementOwner::LocalWorker(_)) && self.tier.is_gpu()
+    }
+}
+
+/// Environment variable that enables CPU-only KV event routing (LMCache offloading).
+pub const DYN_CPU_KV_EVENTS_ONLY: &str = "DYN_CPU_KV_EVENTS_ONLY";
+
+/// Controls which storage tiers are forwarded to the KV router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvEventTierMode {
+    /// Only GPU-resident (device tier) events are routed. Default behavior.
+    #[default]
+    GpuOnly,
+    /// Only non-GPU tiers (e.g. LMCache CPU offloading) are routed.
+    CpuOnly,
+}
+
+impl KvEventTierMode {
+    pub fn from_env() -> Self {
+        match env::var(DYN_CPU_KV_EVENTS_ONLY) {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Self::CpuOnly,
+                _ => Self::GpuOnly,
+            },
+            Err(_) => Self::GpuOnly,
+        }
+    }
+
+    pub fn accepts_placement(&self, placement: &Placement) -> bool {
+        match self {
+            Self::GpuOnly => placement.is_local_gpu(),
+            Self::CpuOnly => {
+                matches!(placement.owner, PlacementOwner::LocalWorker(_)) && !placement.tier.is_gpu()
+            }
+        }
     }
 }
 
@@ -735,6 +778,15 @@ impl RouterEvent {
     }
 }
 
+impl KvEventTierMode {
+    pub fn accepts_router_event(&self, event: &RouterEvent) -> bool {
+        match self {
+            Self::GpuOnly => event.storage_tier.is_gpu(),
+            Self::CpuOnly => !event.storage_tier.is_gpu(),
+        }
+    }
+}
+
 /// Scores representing the overlap of workers (with their dp_rank).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlapScores {
@@ -934,6 +986,37 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json;
+
+    #[test]
+    fn test_from_kv_medium_lmcache_cpu() {
+        assert_eq!(
+            StorageTier::from_kv_medium("cpu"),
+            Some(StorageTier::HostPinned)
+        );
+        assert_eq!(
+            StorageTier::from_kv_medium("CPU"),
+            Some(StorageTier::HostPinned)
+        );
+        assert_eq!(
+            StorageTier::from_kv_medium("cuda:0"),
+            Some(StorageTier::Device)
+        );
+        assert_eq!(
+            StorageTier::from_kv_medium("GPU"),
+            Some(StorageTier::Device)
+        );
+    }
+
+    #[test]
+    fn test_kv_event_tier_mode_accepts_placement() {
+        let gpu = Placement::local_gpu(1, 0);
+        let cpu = Placement::local_worker(1, 0, StorageTier::HostPinned);
+
+        assert!(KvEventTierMode::GpuOnly.accepts_placement(&gpu));
+        assert!(!KvEventTierMode::GpuOnly.accepts_placement(&cpu));
+        assert!(!KvEventTierMode::CpuOnly.accepts_placement(&gpu));
+        assert!(KvEventTierMode::CpuOnly.accepts_placement(&cpu));
+    }
 
     #[test]
     fn test_router_event_new() {

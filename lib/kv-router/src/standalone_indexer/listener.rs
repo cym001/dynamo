@@ -8,7 +8,7 @@ use rmp_serde as rmps;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocols::{WorkerId, WorkerWithDpRank};
+use crate::protocols::{KvEventTierMode, WorkerId, WorkerWithDpRank};
 use crate::recovery::{CursorObservation, CursorState};
 use crate::zmq_wire::{KvEventBatch, convert_event};
 
@@ -39,6 +39,7 @@ struct ListenerLoop {
     replay_socket: Option<SharedSocket>,
     watermark: Arc<AtomicU64>,
     warning_count: Arc<AtomicU32>,
+    tier_mode: KvEventTierMode,
     messages_processed: u64,
 }
 
@@ -64,6 +65,7 @@ impl ListenerLoop {
             replay_socket,
             watermark,
             warning_count: Arc::new(AtomicU32::new(0)),
+            tier_mode: KvEventTierMode::from_env(),
             messages_processed: 0,
         }
     }
@@ -161,7 +163,7 @@ impl ListenerLoop {
                     WorkerWithDpRank::new(worker_id, effective_dp_rank),
                     warning_count,
                 );
-                if !placement_event.placement.is_local_gpu() {
+                if !self.tier_mode.accepts_placement(&placement_event.placement) {
                     continue;
                 }
                 let router_event = placement_event
@@ -230,7 +232,7 @@ impl ListenerLoop {
                 WorkerWithDpRank::new(self.worker_id, effective_dp_rank),
                 &self.warning_count,
             );
-            if !placement_event.placement.is_local_gpu() {
+            if !self.tier_mode.accepts_placement(&placement_event.placement) {
                 continue;
             }
             let router_event = placement_event

@@ -5,7 +5,7 @@ use super::{Indexer, worker_query::WorkerQueryClient};
 use anyhow::Result;
 use dynamo_kv_router::{
     config::KvRouterConfig,
-    protocols::{KV_EVENT_SUBJECT, RouterEvent},
+    protocols::{KV_EVENT_SUBJECT, KvEventTierMode, RouterEvent},
 };
 use dynamo_runtime::{
     component::Component, discovery::EventTransportKind, prelude::*,
@@ -67,6 +67,14 @@ async fn start_kv_router_background_event_plane(
         }
     }
 
+    let tier_mode = KvEventTierMode::from_env();
+    if tier_mode == KvEventTierMode::CpuOnly {
+        tracing::info!(
+            "KV Router using CPU-only tier mode ({})",
+            dynamo_kv_router::protocols::DYN_CPU_KV_EVENTS_ONLY
+        );
+    }
+
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -92,6 +100,17 @@ async fn start_kv_router_background_event_plane(
                         envelope.publisher_id,
                         envelope.sequence
                     );
+
+                    if !tier_mode.accepts_router_event(&event) {
+                        tracing::trace!(
+                            worker_id = event.worker_id,
+                            dp_rank = event.event.dp_rank,
+                            event_id = event.event.event_id,
+                            storage_tier = ?event.storage_tier,
+                            "Skipping router event due to tier filter"
+                        );
+                        continue;
+                    }
 
                     tracing::trace!(
                         "Forwarding live event to recovery coordinator for worker {} dp_rank {} event_id {}",

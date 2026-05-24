@@ -690,4 +690,23 @@ mod tests {
             other => panic!("expected Stored event, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_convert_event_lmcache_cpu_medium() {
+        let raw_event = RawKvEvent::BlockStored {
+            block_hashes: vec![BlockHashValue::Unsigned(42)],
+            parent_block_hash: None,
+            token_ids: vec![1, 2, 3, 4],
+            block_size: 4,
+            medium: Some("cpu".to_string()),
+            lora_name: None,
+            block_mm_infos: None,
+            is_eagle: None,
+        };
+        let warning_count = Arc::new(AtomicU32::new(0));
+        let placement_event =
+            convert_event(raw_event, 1, 4, WorkerWithDpRank::new(2, 0), &warning_count);
+
+        assert_eq!(placement_event.placement.tier, StorageTier::HostPinned);
+    }
 }
