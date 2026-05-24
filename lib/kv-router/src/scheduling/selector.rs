@@ -92,11 +92,71 @@ fn softmax_sample_with_sample(
     entries[entries.len() - 1]
 }
 
+const DYN_ROUTER_WORKER_SELECTION_FORMULA: &str = "DYN_ROUTER_WORKER_SELECTION_FORMULA";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerSelectionFormula {
+    OverlapLoad,
+    Lmetric,
+    Vllm,
+    Random,
+}
+
+impl WorkerSelectionFormula {
+    fn from_env() -> Self {
+        let Ok(value) = std::env::var(DYN_ROUTER_WORKER_SELECTION_FORMULA) else {
+            return Self::OverlapLoad;
+        };
+
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "default" | "overlap-load" | "overlap_load" | "overlapload" => Self::OverlapLoad,
+            "lmetric" => Self::Lmetric,
+            "vllm" => Self::Vllm,
+            "random" => Self::Random,
+            other => {
+                tracing::warn!(
+                    env_var = DYN_ROUTER_WORKER_SELECTION_FORMULA,
+                    value = other,
+                    "unknown worker selection formula, falling back to overlap-load"
+                );
+                Self::OverlapLoad
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OverlapLoad => "overlap-load",
+            Self::Lmetric => "lmetric",
+            Self::Vllm => "vllm",
+            Self::Random => "random",
+        }
+    }
+}
+
+fn overlap_load_score(overlap_weight: f64, potential_prefill_block: f64, decode_block: f64) -> f64 {
+    overlap_weight * potential_prefill_block + decode_block
+}
+
+fn lmetric_score(isl: usize, overlap_blocks: u32, block_size: u32, active_requests: usize) -> f64 {
+    let cached_tokens = overlap_blocks as usize * block_size as usize;
+    let new_tokens = isl.saturating_sub(cached_tokens);
+    (new_tokens as f64) * ((active_requests + 1) as f64)
+}
+
+fn vllm_score(active_requests: usize, max_batch: usize) -> (f64, usize, usize) {
+    let candidate_active_requests = active_requests + 1;
+    let running = candidate_active_requests.min(max_batch);
+    let waiting = candidate_active_requests.saturating_sub(max_batch);
+    ((waiting * 4 + running) as f64, waiting, running)
+}
+
 /// Default implementation matching the Python _cost_function.
 #[derive(Debug, Clone)]
 pub struct DefaultWorkerSelector {
     pub kv_router_config: KvRouterConfig,
     pub worker_type: &'static str,
+    worker_selection_formula: WorkerSelectionFormula,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,21 +165,41 @@ struct WorkerScore {
     logit: f64,
 }
 
+impl Default for DefaultWorkerSelector {
+    fn default() -> Self {
+        Self {
+            kv_router_config: KvRouterConfig::default(),
+            worker_type: "unknown",
+            worker_selection_formula: WorkerSelectionFormula::OverlapLoad,
+        }
+    }
+}
+
 impl DefaultWorkerSelector {
     pub fn new(kv_router_config: Option<KvRouterConfig>, worker_type: &'static str) -> Self {
         Self {
             kv_router_config: kv_router_config.unwrap_or_default(),
             worker_type,
+            worker_selection_formula: WorkerSelectionFormula::from_env(),
         }
     }
 
-    fn worker_score(
+    fn effective_formula(&self) -> WorkerSelectionFormula {
+        if self.worker_type == "prefill" {
+            self.worker_selection_formula
+        } else {
+            WorkerSelectionFormula::OverlapLoad
+        }
+    }
+
+    fn worker_score<C: WorkerConfigLike>(
         &self,
         request: &SchedulingRequest,
         worker: WorkerWithDpRank,
+        config: &C,
         block_size: u32,
         overlap_weight: f64,
-        formula_name: &'static str,
+        formula: WorkerSelectionFormula,
     ) -> WorkerScore {
         let isl = request.isl_tokens;
         let overlap_blocks = request.overlaps.scores.get(&worker).copied().unwrap_or(0);
@@ -135,14 +215,47 @@ impl DefaultWorkerSelector {
             .get(&worker)
             .copied()
             .unwrap_or(potential_prefill_block.floor() as usize) as f64;
-        let logit = overlap_weight * potential_prefill_block + decode_block;
+        let active_requests = request
+            .active_request_counts
+            .get(&worker)
+            .copied()
+            .unwrap_or(0);
+        let max_batch = config
+            .max_num_seqs()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(usize::MAX);
+
+        let logit = match formula {
+            WorkerSelectionFormula::OverlapLoad => {
+                overlap_load_score(overlap_weight, potential_prefill_block, decode_block)
+            }
+            WorkerSelectionFormula::Lmetric => {
+                lmetric_score(isl, overlap_blocks, block_size, active_requests)
+            }
+            WorkerSelectionFormula::Vllm => {
+                let (score, waiting, running) = vllm_score(active_requests, max_batch);
+                tracing::debug!(
+                    worker_id = worker.worker_id,
+                    dp_rank = worker.dp_rank,
+                    active_requests,
+                    max_batch,
+                    waiting,
+                    running,
+                    score,
+                    "vLLM worker selection score"
+                );
+                score
+            }
+            WorkerSelectionFormula::Random => 0.0,
+        };
 
         tracing::debug!(
-            "{formula_name} for worker_id={} dp_rank={:?} with {overlap_blocks} cached blocks: {logit:.3} \
+            "Worker selection score for worker_id={} dp_rank={:?}, formula={} with {overlap_blocks} cached blocks: {logit:.3} \
              = {overlap_weight:.1} * prefill_blocks + decode_blocks \
              = {overlap_weight:.1} * {potential_prefill_block:.3} + {decode_block:.3}",
             worker.worker_id,
-            worker.dp_rank
+            worker.dp_rank,
+            formula.as_str()
         );
 
         WorkerScore {
@@ -177,21 +290,18 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         let request_blocks = isl.div_ceil(block_size as usize);
         let overlaps = &request.overlaps.scores;
 
+        let formula = self.effective_formula();
+
         if let Some(worker) = pinned_worker {
-            pinned_worker_config(workers, worker)?;
+            let config = pinned_worker_config(workers, worker)?;
 
             let overlap_weight = request
                 .router_config_override
                 .as_ref()
                 .and_then(|cfg| cfg.overlap_score_weight)
                 .unwrap_or(self.kv_router_config.overlap_score_weight);
-            let score = self.worker_score(
-                request,
-                worker,
-                block_size,
-                overlap_weight,
-                "Pinned formula",
-            );
+            let score =
+                self.worker_score(request, worker, config, block_size, overlap_weight, formula);
 
             return Ok(WorkerSelectionResult {
                 worker,
@@ -212,8 +322,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             .and_then(|cfg| cfg.router_temperature)
             .unwrap_or(self.kv_router_config.router_temperature);
 
-        let get_score = |worker: WorkerWithDpRank| -> f64 {
-            self.worker_score(request, worker, block_size, overlap_weight, "Formula")
+        let get_score = |worker: WorkerWithDpRank, config: &C| -> f64 {
+            self.worker_score(request, worker, config, block_size, overlap_weight, formula)
                 .logit
         };
 
@@ -224,51 +334,58 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let data_parallel_size = config.data_parallel_size();
                 let data_parallel_start_rank = config.data_parallel_start_rank();
                 (data_parallel_start_rank..(data_parallel_start_rank + data_parallel_size))
-                    .map(move |dp_rank| WorkerWithDpRank::new(*worker_id, dp_rank))
+                    .map(move |dp_rank| (WorkerWithDpRank::new(*worker_id, dp_rank), config))
             });
 
-        let (best_worker, best_logit) = if temperature == 0.0 {
-            let mut min_workers = Vec::new();
-            let mut min_score = f64::INFINITY;
-            for worker in worker_iter {
-                let score = get_score(worker);
-                if score < min_score {
-                    min_workers.clear();
-                    min_workers.push(worker);
-                    min_score = score;
-                } else if score == min_score {
-                    min_workers.push(worker);
+        let (best_worker, best_logit) =
+            if temperature == 0.0 && formula != WorkerSelectionFormula::Random {
+                let mut min_workers = Vec::new();
+                let mut min_score = f64::INFINITY;
+                for (worker, config) in worker_iter {
+                    let score = get_score(worker, config);
+                    if score < min_score {
+                        min_workers.clear();
+                        min_workers.push(worker);
+                        min_score = score;
+                    } else if score == min_score {
+                        min_workers.push(worker);
+                    }
                 }
-            }
 
-            if min_workers.len() > 1 {
-                tracing::debug!(
-                    "Multiple workers tied with same logit, using tree size as tie-breaker"
-                );
-                let tree_sizes: Vec<(usize, &WorkerWithDpRank)> = min_workers
-                    .iter()
-                    .map(|w| (request.overlaps.tree_sizes.get(w).copied().unwrap_or(0), w))
-                    .collect();
+                if min_workers.len() > 1 {
+                    tracing::debug!(
+                        "Multiple workers tied with same logit, using tree size as tie-breaker"
+                    );
+                    let tree_sizes: Vec<(usize, &WorkerWithDpRank)> = min_workers
+                        .iter()
+                        .map(|w| (request.overlaps.tree_sizes.get(w).copied().unwrap_or(0), w))
+                        .collect();
 
-                if tree_sizes.iter().all(|(s, _)| *s == tree_sizes[0].0) {
-                    let idx = rand::rng().random_range(0..min_workers.len());
-                    (min_workers[idx], min_score)
+                    if tree_sizes.iter().all(|(s, _)| *s == tree_sizes[0].0) {
+                        let idx = rand::rng().random_range(0..min_workers.len());
+                        (min_workers[idx], min_score)
+                    } else {
+                        let (_, worker) = *tree_sizes.iter().min_by_key(|(s, _)| *s).unwrap();
+                        (*worker, min_score)
+                    }
                 } else {
-                    let (_, worker) = *tree_sizes.iter().min_by_key(|(s, _)| *s).unwrap();
-                    (*worker, min_score)
+                    (min_workers[0], min_score)
                 }
             } else {
-                (min_workers[0], min_score)
-            }
-        } else {
-            let mut worker_logits = FxHashMap::default();
-            for worker in worker_iter {
-                let score = get_score(worker);
-                worker_logits.insert(worker, score);
-            }
+                let mut worker_logits = FxHashMap::default();
+                for (worker, config) in worker_iter {
+                    let score = get_score(worker, config);
+                    worker_logits.insert(worker, score);
+                }
 
-            softmax_sample(&worker_logits, temperature)
-        };
+                if formula == WorkerSelectionFormula::Random {
+                    let entries: Vec<_> = worker_logits.into_iter().collect();
+                    let idx = rand::rng().random_range(0..entries.len());
+                    entries[idx]
+                } else {
+                    softmax_sample(&worker_logits, temperature)
+                }
+            };
 
         if self.worker_type == "decode" {
             tracing::info!(

@@ -188,6 +188,7 @@ where
             overlaps,
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_request_counts: FxHashMap::default(),
             track_prefill_tokens,
             router_config_override: router_config_override.cloned(),
             update_states,

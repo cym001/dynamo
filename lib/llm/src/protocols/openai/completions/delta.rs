@@ -382,6 +382,10 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateCompletionResponse> for
         DeltaGenerator::is_continuous_usage_enabled(self)
     }
 
+    fn model(&self) -> &str {
+        &self.model
+    }
+
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage {
         DeltaGenerator::get_usage(self)
     }

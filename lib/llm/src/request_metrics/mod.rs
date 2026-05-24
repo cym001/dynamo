@@ -31,8 +31,7 @@ pub fn publish_from_tracker(
     if !enabled() {
         return;
     }
-    let include_kv =
-        tracker.kv_hit_rate().is_some() || tracker.max_kv_hit_rate().is_some();
+    let include_kv = tracker.kv_hit_rate().is_some() || tracker.max_kv_hit_rate().is_some();
     let rec = RequestMetricsRecord::from_tracker(
         tracker,
         request_id,

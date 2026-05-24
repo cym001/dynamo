@@ -28,7 +28,8 @@ async fn test_request_metrics_bus_publish() {
     tracker.record_max_kv_hit(7, 10);
     tracker.record_osl(42);
 
-    let rec = RequestMetricsRecord::from_tracker(&tracker, "test-req", "test-model", Some("kv"), true);
+    let rec =
+        RequestMetricsRecord::from_tracker(&tracker, "test-req", "test-model", Some("kv"), true);
     dynamo_llm::request_metrics::publish(rec.clone());
 
     let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())

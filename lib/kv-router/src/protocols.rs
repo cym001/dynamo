@@ -176,6 +176,9 @@ pub fn compute_seq_hash_for_block(block_hashes: &[LocalBlockHash]) -> Vec<Sequen
 pub trait WorkerConfigLike {
     fn data_parallel_start_rank(&self) -> u32;
     fn data_parallel_size(&self) -> u32;
+    fn max_num_seqs(&self) -> Option<u64> {
+        None
+    }
     fn max_num_batched_tokens(&self) -> Option<u64>;
     fn total_kv_blocks(&self) -> Option<u64>;
 }
@@ -973,12 +976,8 @@ mod tests {
     #[test]
     fn test_overlap_scores_max_overlap_blocks() {
         let mut overlap_scores = OverlapScores::new();
-        overlap_scores
-            .scores
-            .insert(WorkerWithDpRank::new(1, 0), 3);
-        overlap_scores
-            .scores
-            .insert(WorkerWithDpRank::new(2, 0), 7);
+        overlap_scores.scores.insert(WorkerWithDpRank::new(1, 0), 3);
+        overlap_scores.scores.insert(WorkerWithDpRank::new(2, 0), 7);
         assert_eq!(overlap_scores.max_overlap_blocks(), 7);
     }
 

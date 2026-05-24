@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use super::single::RequestId;
 use crate::protocols::WorkerWithDpRank;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Default)]
 pub(super) struct RequestIndex {
@@ -87,6 +88,14 @@ impl RequestIndex {
         for entry in self.request_to_lora.iter() {
             let lora_name = entry.value().clone();
             *counts.entry(lora_name).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    pub(super) fn active_request_counts(&self) -> FxHashMap<WorkerWithDpRank, usize> {
+        let mut counts = FxHashMap::default();
+        for entry in self.request_to_worker.iter() {
+            *counts.entry(*entry.value()).or_insert(0) += 1;
         }
         counts
     }

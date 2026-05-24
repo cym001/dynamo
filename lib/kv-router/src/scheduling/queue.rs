@@ -245,6 +245,7 @@ impl<
             );
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
+        request.active_request_counts = self.slots.active_request_counts();
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -632,6 +633,7 @@ mod tests {
             overlaps: OverlapScores::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_request_counts: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,
@@ -1023,6 +1025,7 @@ mod tests {
             overlaps: OverlapScores::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            active_request_counts: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,

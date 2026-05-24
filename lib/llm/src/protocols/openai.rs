@@ -276,6 +276,9 @@ pub trait DeltaGeneratorExt<ResponseType: Send + 'static + std::fmt::Debug>:
     /// Check if continuous usage tracking is enabled.
     fn is_continuous_usage_enabled(&self) -> bool;
 
+    /// Get the response model name.
+    fn model(&self) -> &str;
+
     /// Get the current usage statistics with properly calculated total_tokens.
     fn get_usage(&self) -> dynamo_protocols::types::CompletionUsage;
 
