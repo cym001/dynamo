@@ -85,13 +85,8 @@ mod tests {
         tracker.record_max_kv_hit(7, 10);
         tracker.record_osl(50);
 
-        let rec = RequestMetricsRecord::from_tracker(
-            &tracker,
-            "req-1",
-            "test-model",
-            Some("kv"),
-            true,
-        );
+        let rec =
+            RequestMetricsRecord::from_tracker(&tracker, "req-1", "test-model", Some("kv"), true);
 
         assert_eq!(rec.request_id, "req-1");
         assert_eq!(rec.input_tokens, 100);

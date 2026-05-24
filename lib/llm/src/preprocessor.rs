@@ -917,7 +917,7 @@ impl OpenAIPreprocessor {
                             crate::request_metrics::publish_from_tracker(
                                 tracker,
                                 inner.context.id(),
-                                &inner.response_generator.model,
+                                inner.response_generator.model(),
                             );
                         }
 

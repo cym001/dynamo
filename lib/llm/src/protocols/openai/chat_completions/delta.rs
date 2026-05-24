@@ -430,11 +430,7 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         let timing_info: Option<TimingInfo> = if finish_reason.is_some() {
             self.tracker.as_ref().map(|tracker| {
                 tracker.record_finish();
-                crate::request_metrics::publish_from_tracker(
-                    tracker,
-                    &self.id,
-                    &self.model,
-                );
+                crate::request_metrics::publish_from_tracker(tracker, &self.id, &self.model);
                 tracker.get_timing_info()
             })
         } else {
@@ -489,6 +485,10 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
 
     fn is_continuous_usage_enabled(&self) -> bool {
         DeltaGenerator::is_continuous_usage_enabled(self)
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn get_usage(&self) -> dynamo_async_openai::types::CompletionUsage {

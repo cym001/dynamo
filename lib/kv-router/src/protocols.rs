@@ -732,12 +732,8 @@ mod tests {
     #[test]
     fn test_overlap_scores_max_overlap_blocks() {
         let mut overlap_scores = OverlapScores::new();
-        overlap_scores
-            .scores
-            .insert(WorkerWithDpRank::new(1, 0), 3);
-        overlap_scores
-            .scores
-            .insert(WorkerWithDpRank::new(2, 0), 7);
+        overlap_scores.scores.insert(WorkerWithDpRank::new(1, 0), 3);
+        overlap_scores.scores.insert(WorkerWithDpRank::new(2, 0), 7);
         assert_eq!(overlap_scores.max_overlap_blocks(), 7);
     }
 

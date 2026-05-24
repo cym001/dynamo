@@ -9,7 +9,7 @@ use super::queue::SchedulerQueue;
 use super::sequence::{
     ActiveSequencesMulti, SequenceError, SequenceRequest, create_multi_worker_sequences,
 };
-use crate::discovery::RuntimeConfigWatch;
+use crate::discovery::{RuntimeConfigWatch, WORKER_TYPE_PREFILL};
 use crate::local_model::runtime_config::ModelRuntimeConfig;
 use anyhow::Result;
 use dynamo_runtime::component::Component;
@@ -57,6 +57,7 @@ pub struct SchedulingRequest {
     pub overlaps: OverlapScores,
     pub decode_blocks: HashMap<WorkerWithDpRank, usize>,
     pub prefill_tokens: HashMap<WorkerWithDpRank, usize>,
+    pub active_request_counts: HashMap<WorkerWithDpRank, usize>,
     // Router config overrides for this specific request
     pub router_config_override: Option<RouterConfigOverride>,
     // Whether to update scheduler states (false for query_instance_id requests)
@@ -223,6 +224,7 @@ impl KvScheduler {
             overlaps,
             decode_blocks: HashMap::new(),
             prefill_tokens: HashMap::new(),
+            active_request_counts: HashMap::new(),
             router_config_override: router_config_override.cloned(),
             update_states,
             lora_name,
@@ -389,16 +391,97 @@ fn softmax_sample(
     vec![keys[keys.len() - 1]]
 }
 
+const DYN_ROUTER_WORKER_SELECTION_FORMULA: &str = "DYN_ROUTER_WORKER_SELECTION_FORMULA";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerSelectionFormula {
+    OverlapLoad,
+    Lmetric,
+    Vllm,
+    Random,
+}
+
+impl WorkerSelectionFormula {
+    fn from_env() -> Self {
+        let Ok(value) = std::env::var(DYN_ROUTER_WORKER_SELECTION_FORMULA) else {
+            return Self::OverlapLoad;
+        };
+
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "default" | "overlap-load" | "overlap_load" | "overlapload" => Self::OverlapLoad,
+            "lmetric" => Self::Lmetric,
+            "vllm" => Self::Vllm,
+            "random" => Self::Random,
+            other => {
+                tracing::warn!(
+                    env_var = DYN_ROUTER_WORKER_SELECTION_FORMULA,
+                    value = other,
+                    "Unknown worker selection formula, falling back to overlap-load"
+                );
+                Self::OverlapLoad
+            }
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OverlapLoad => "overlap-load",
+            Self::Lmetric => "lmetric",
+            Self::Vllm => "vllm",
+            Self::Random => "random",
+        }
+    }
+}
+
+fn overlap_load_score(overlap_weight: f64, potential_prefill_block: f64, decode_block: f64) -> f64 {
+    overlap_weight * potential_prefill_block + decode_block
+}
+
+fn lmetric_score(isl: usize, overlap_blocks: u32, block_size: u32, active_requests: usize) -> f64 {
+    let cached_tokens = overlap_blocks as usize * block_size as usize;
+    let new_tokens = isl.saturating_sub(cached_tokens);
+    (new_tokens as f64) * ((active_requests + 1) as f64)
+}
+
+fn vllm_score(active_requests: usize, max_batch: usize) -> (f64, usize, usize) {
+    let candidate_active_requests = active_requests + 1;
+    let running = candidate_active_requests.min(max_batch);
+    let waiting = candidate_active_requests.saturating_sub(max_batch);
+    ((waiting * 4 + running) as f64, waiting, running)
+}
+
 // Default implementation matching the Python _cost_function
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DefaultWorkerSelector {
     pub kv_router_config: KvRouterConfig,
+    pub worker_type: &'static str,
+    worker_selection_formula: WorkerSelectionFormula,
+}
+
+impl Default for DefaultWorkerSelector {
+    fn default() -> Self {
+        Self {
+            kv_router_config: KvRouterConfig::default(),
+            worker_type: "unknown",
+            worker_selection_formula: WorkerSelectionFormula::OverlapLoad,
+        }
+    }
 }
 
 impl DefaultWorkerSelector {
-    pub fn new(kv_router_config: Option<KvRouterConfig>) -> Self {
+    pub fn new(kv_router_config: Option<KvRouterConfig>, worker_type: &'static str) -> Self {
         Self {
             kv_router_config: kv_router_config.unwrap_or_default(),
+            worker_type,
+            worker_selection_formula: WorkerSelectionFormula::from_env(),
+        }
+    }
+
+    fn effective_formula(&self) -> WorkerSelectionFormula {
+        if self.worker_type == WORKER_TYPE_PREFILL {
+            self.worker_selection_formula
+        } else {
+            WorkerSelectionFormula::OverlapLoad
         }
     }
 }
@@ -428,6 +511,7 @@ impl WorkerSelector for DefaultWorkerSelector {
         let prefill_tokens = &request.prefill_tokens;
 
         let mut worker_logits = HashMap::new();
+        let formula = self.effective_formula();
 
         // Use override if provided, otherwise use default config
         let overlap_weight = request
@@ -442,6 +526,10 @@ impl WorkerSelector for DefaultWorkerSelector {
         {
             let data_parallel_size = config.data_parallel_size;
             let data_parallel_start_rank = config.data_parallel_start_rank;
+            let max_batch = config
+                .max_num_seqs
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(usize::MAX);
 
             for dp_rank in data_parallel_start_rank..data_parallel_start_rank + data_parallel_size {
                 let worker = WorkerWithDpRank::new(*worker_id, dp_rank);
@@ -459,19 +547,56 @@ impl WorkerSelector for DefaultWorkerSelector {
                     .unwrap_or(&(potential_prefill_block.floor() as usize))
                     as f64;
 
-                // Calculate logit (lower is better)
-                let logit = overlap_weight * potential_prefill_block + decode_block;
+                let active_requests = request
+                    .active_request_counts
+                    .get(&worker)
+                    .copied()
+                    .unwrap_or(0);
+
+                // Calculate score/logit (lower is better)
+                let logit = match formula {
+                    WorkerSelectionFormula::OverlapLoad => {
+                        overlap_load_score(overlap_weight, potential_prefill_block, decode_block)
+                    }
+                    WorkerSelectionFormula::Lmetric => {
+                        lmetric_score(isl, overlap, block_size, active_requests)
+                    }
+                    WorkerSelectionFormula::Vllm => {
+                        let (score, waiting, running) = vllm_score(active_requests, max_batch);
+                        tracing::debug!(
+                            worker_id = worker.worker_id,
+                            dp_rank = worker.dp_rank,
+                            active_requests,
+                            max_batch,
+                            waiting,
+                            running,
+                            score,
+                            "vLLM worker selection score"
+                        );
+                        score
+                    }
+                    WorkerSelectionFormula::Random => 0.0,
+                };
 
                 worker_logits.insert(worker, logit);
 
                 tracing::debug!(
-                    "Formula for worker_id={} dp_rank={:?} with {overlap} cached blocks: {logit:.3} \
-                     = {overlap_weight:.1} * prefill_blocks + decode_blocks \
-                     = {overlap_weight:.1} * {potential_prefill_block:.3} + {decode_block:.3}",
-                    worker.worker_id,
-                    worker.dp_rank
+                    worker_id = worker.worker_id,
+                    dp_rank = worker.dp_rank,
+                    formula = formula.as_str(),
+                    overlap,
+                    logit,
+                    overlap_weight,
+                    potential_prefill_block,
+                    decode_block,
+                    active_requests,
+                    "Worker selection score calculated"
                 );
             }
+        }
+
+        if worker_logits.is_empty() {
+            return Err(KvSchedulerError::NoEndpoints);
         }
 
         // Use softmax sampling to select worker(s)
@@ -481,7 +606,13 @@ impl WorkerSelector for DefaultWorkerSelector {
             .as_ref()
             .and_then(|cfg| cfg.router_temperature)
             .unwrap_or(self.kv_router_config.router_temperature);
-        let candidates = softmax_sample(&worker_logits, temperature);
+        let candidates = if formula == WorkerSelectionFormula::Random {
+            let keys: Vec<WorkerWithDpRank> = worker_logits.keys().copied().collect();
+            let idx = rand::rng().random_range(0..keys.len());
+            vec![keys[idx]]
+        } else {
+            softmax_sample(&worker_logits, temperature)
+        };
 
         // If multiple candidates (tied), use tree size as tie-breaker
         // If tree sizes are also equal, use random selection to avoid bias
@@ -523,9 +654,10 @@ impl WorkerSelector for DefaultWorkerSelector {
             .unwrap_or(0);
 
         tracing::info!(
-            "Selected worker: worker_id={} dp_rank={:?}, logit: {:.3}, cached blocks: {}, tree size: {}{}",
+            "Selected worker: worker_id={} dp_rank={:?}, formula: {}, logit: {:.3}, cached blocks: {}, tree size: {}{}",
             best_worker.worker_id,
             best_worker.dp_rank,
+            formula.as_str(),
             best_logit,
             best_overlap,
             tree_size,
@@ -543,6 +675,194 @@ impl WorkerSelector for DefaultWorkerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::common::timing::WORKER_TYPE_DECODE;
+
+    fn worker_config(max_num_seqs: Option<u64>) -> ModelRuntimeConfig {
+        let mut config = ModelRuntimeConfig::new();
+        config.max_num_seqs = max_num_seqs;
+        config
+    }
+
+    fn scheduling_request(
+        isl_tokens: usize,
+        overlaps: Vec<(WorkerWithDpRank, u32)>,
+        active_request_counts: Vec<(WorkerWithDpRank, usize)>,
+    ) -> SchedulingRequest {
+        let mut overlap_scores = OverlapScores::new();
+        for (worker, overlap) in overlaps {
+            overlap_scores.scores.insert(worker, overlap);
+        }
+
+        SchedulingRequest {
+            maybe_request_id: None,
+            token_seq: None,
+            isl_tokens,
+            overlaps: overlap_scores,
+            decode_blocks: HashMap::new(),
+            prefill_tokens: HashMap::new(),
+            active_request_counts: active_request_counts.into_iter().collect(),
+            router_config_override: None,
+            update_states: false,
+            lora_name: None,
+            priority_jump: 0.0,
+            allowed_worker_ids: None,
+            resp_tx: None,
+        }
+    }
+
+    fn selector_with_formula(
+        formula: WorkerSelectionFormula,
+        worker_type: &'static str,
+    ) -> DefaultWorkerSelector {
+        DefaultWorkerSelector {
+            kv_router_config: KvRouterConfig::default(),
+            worker_type,
+            worker_selection_formula: formula,
+        }
+    }
+
+    #[test]
+    fn test_worker_selection_formula_from_env() {
+        let previous = std::env::var(DYN_ROUTER_WORKER_SELECTION_FORMULA).ok();
+
+        unsafe {
+            std::env::remove_var(DYN_ROUTER_WORKER_SELECTION_FORMULA);
+        }
+        assert_eq!(
+            WorkerSelectionFormula::from_env(),
+            WorkerSelectionFormula::OverlapLoad
+        );
+
+        unsafe {
+            std::env::set_var(DYN_ROUTER_WORKER_SELECTION_FORMULA, "lmetric");
+        }
+        assert_eq!(
+            WorkerSelectionFormula::from_env(),
+            WorkerSelectionFormula::Lmetric
+        );
+
+        unsafe {
+            std::env::set_var(DYN_ROUTER_WORKER_SELECTION_FORMULA, "vllm");
+        }
+        assert_eq!(
+            WorkerSelectionFormula::from_env(),
+            WorkerSelectionFormula::Vllm
+        );
+
+        unsafe {
+            std::env::set_var(DYN_ROUTER_WORKER_SELECTION_FORMULA, "random");
+        }
+        assert_eq!(
+            WorkerSelectionFormula::from_env(),
+            WorkerSelectionFormula::Random
+        );
+
+        unsafe {
+            std::env::set_var(DYN_ROUTER_WORKER_SELECTION_FORMULA, "unknown");
+        }
+        assert_eq!(
+            WorkerSelectionFormula::from_env(),
+            WorkerSelectionFormula::OverlapLoad
+        );
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(DYN_ROUTER_WORKER_SELECTION_FORMULA, value);
+            } else {
+                std::env::remove_var(DYN_ROUTER_WORKER_SELECTION_FORMULA);
+            }
+        }
+    }
+
+    #[test]
+    fn test_lmetric_selects_lowest_new_tokens_times_batch() {
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let workers = HashMap::from([(1, worker_config(Some(8))), (2, worker_config(Some(8)))]);
+        let request = scheduling_request(
+            64,
+            vec![(worker1, 1), (worker2, 3)],
+            vec![(worker1, 0), (worker2, 1)],
+        );
+
+        let selector = selector_with_formula(WorkerSelectionFormula::Lmetric, WORKER_TYPE_PREFILL);
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(result.worker, worker2);
+        assert_eq!(result.overlap_blocks, 3);
+    }
+
+    #[test]
+    fn test_vllm_selects_lowest_waiting_weighted_score() {
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let workers = HashMap::from([(1, worker_config(Some(2))), (2, worker_config(Some(4)))]);
+        let request = scheduling_request(
+            64,
+            vec![(worker1, 0), (worker2, 0)],
+            vec![(worker1, 2), (worker2, 3)],
+        );
+
+        let selector = selector_with_formula(WorkerSelectionFormula::Vllm, WORKER_TYPE_PREFILL);
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(result.worker, worker2);
+    }
+
+    #[test]
+    fn test_random_respects_allowed_workers() {
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let workers = HashMap::from([(1, worker_config(Some(8))), (2, worker_config(Some(8)))]);
+        let mut request = scheduling_request(64, vec![(worker1, 0), (worker2, 2)], Vec::new());
+        request.allowed_worker_ids = Some(HashSet::from([2]));
+
+        let selector = selector_with_formula(WorkerSelectionFormula::Random, WORKER_TYPE_PREFILL);
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(result.worker, worker2);
+        assert_eq!(result.overlap_blocks, 2);
+    }
+
+    #[test]
+    fn test_decode_worker_ignores_non_default_formula() {
+        let worker1 = WorkerWithDpRank::from_worker_id(1);
+        let worker2 = WorkerWithDpRank::from_worker_id(2);
+        let workers = HashMap::from([(1, worker_config(Some(1))), (2, worker_config(Some(1)))]);
+        let mut request = scheduling_request(
+            64,
+            vec![(worker1, 0), (worker2, 3)],
+            vec![(worker1, 100), (worker2, 0)],
+        );
+        request.prefill_tokens = HashMap::from([(worker1, 16), (worker2, 64)]);
+        request.decode_blocks = HashMap::from([(worker1, 0), (worker2, 10)]);
+
+        let selector = selector_with_formula(WorkerSelectionFormula::Lmetric, WORKER_TYPE_DECODE);
+        let result = selector.select_worker(&workers, &request, 16).unwrap();
+
+        assert_eq!(result.worker, worker1);
+    }
+
+    #[test]
+    fn test_request_metrics_record_keeps_kv_fields_for_new_formulas() {
+        let tracker = crate::protocols::common::timing::RequestTracker::new();
+        tracker.record_kv_hit(2, 4);
+        tracker.record_max_kv_hit(3, 4);
+        tracker.record_worker_full(7, 0, WORKER_TYPE_PREFILL);
+
+        let rec = crate::request_metrics::RequestMetricsRecord::from_tracker(
+            &tracker,
+            "req",
+            "model",
+            Some("kv"),
+            true,
+        );
+
+        assert!(rec.worker.is_some());
+        assert_eq!(rec.selected_kv_hit_rate, Some(0.5));
+        assert_eq!(rec.max_kv_hit_rate, Some(0.75));
+        assert_eq!(rec.router_mode, Some("kv".to_string()));
+    }
 
     #[test]
     fn test_softmax_sample_single_key() {
