@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use tokio::sync::oneshot;
 
-use dynamo_kv_router::{PrefillLoadEstimator, config::KvRouterConfig};
+use dynamo_kv_router::{PrefillLoadEstimator, WorkerSelectionFormula, config::KvRouterConfig};
 use dynamo_runtime::{
     component::{Client, Endpoint},
     pipeline::{PushRouter, RouterMode},
@@ -139,6 +139,7 @@ impl PrefillRouter {
                     kv_router_config,
                     prefill_load_estimator,
                     WORKER_TYPE_PREFILL,
+                    WorkerSelectionFormula::OverlapLoad,
                     Some(self.model_name.clone()),
                     self.is_eagle,
                 )

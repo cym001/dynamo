@@ -1126,6 +1126,7 @@ class RouterMode:
     Random: "RouterMode"
     PowerOfTwoChoices: "RouterMode"
     KV: "RouterMode"
+    Lmetric: "RouterMode"
     Direct: "RouterMode"
     LeastLoaded: "RouterMode"
     DeviceAwareWeighted: "RouterMode"

@@ -135,6 +135,7 @@ impl PendingRequest {
             overlaps: self.overlaps.clone(),
             decode_blocks,
             prefill_tokens,
+            batch_sizes: FxHashMap::default(),
             track_prefill_tokens: self.track_prefill_tokens,
             router_config_override: None,
             update_states: true,

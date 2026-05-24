@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 use anyhow::Context as _;
 use dashmap::{DashMap, DashSet};
-use dynamo_kv_router::PrefillLoadEstimator;
+use dynamo_kv_router::{PrefillLoadEstimator, WorkerSelectionFormula};
 use futures::StreamExt;
 
 use dynamo_runtime::{
@@ -600,7 +600,11 @@ impl ModelWatcher {
             let needs_local_chat_pipeline =
                 card.model_type.supports_chat() && self.chat_engine_factory.is_none();
             let needs_local_completions_pipeline = card.model_type.supports_completions();
-            let kv_chooser = if self.router_config.router_mode == RouterMode::KV
+            let worker_selection_formula = match self.router_config.router_mode {
+                RouterMode::Lmetric => WorkerSelectionFormula::Lmetric,
+                _ => WorkerSelectionFormula::OverlapLoad,
+            };
+            let kv_chooser = if self.router_config.router_mode.is_kv_routing()
                 && (needs_local_chat_pipeline || needs_local_completions_pipeline)
             {
                 Some(
@@ -611,6 +615,7 @@ impl ModelWatcher {
                             Some(self.router_config.kv_router_config.clone()),
                             self.prefill_load_estimator.clone(),
                             WORKER_TYPE_DECODE, // This is the decode router
+                            worker_selection_formula,
                             Some(card.display_name.clone()),
                             card.runtime_config.enable_eagle,
                         )

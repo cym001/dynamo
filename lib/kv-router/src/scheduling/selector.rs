@@ -92,11 +92,19 @@ fn softmax_sample_with_sample(
     entries[entries.len() - 1]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkerSelectionFormula {
+    #[default]
+    OverlapLoad,
+    Lmetric,
+}
+
 /// Default implementation matching the Python _cost_function.
 #[derive(Debug, Clone)]
 pub struct DefaultWorkerSelector {
     pub kv_router_config: KvRouterConfig,
     pub worker_type: &'static str,
+    pub worker_selection_formula: WorkerSelectionFormula,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,9 +115,22 @@ struct WorkerScore {
 
 impl DefaultWorkerSelector {
     pub fn new(kv_router_config: Option<KvRouterConfig>, worker_type: &'static str) -> Self {
+        Self::new_with_formula(
+            kv_router_config,
+            worker_type,
+            WorkerSelectionFormula::OverlapLoad,
+        )
+    }
+
+    pub fn new_with_formula(
+        kv_router_config: Option<KvRouterConfig>,
+        worker_type: &'static str,
+        worker_selection_formula: WorkerSelectionFormula,
+    ) -> Self {
         Self {
             kv_router_config: kv_router_config.unwrap_or_default(),
             worker_type,
+            worker_selection_formula,
         }
     }
 
@@ -123,27 +144,50 @@ impl DefaultWorkerSelector {
     ) -> WorkerScore {
         let isl = request.isl_tokens;
         let overlap_blocks = request.overlaps.scores.get(&worker).copied().unwrap_or(0);
-        let default_prefill_token = if request.track_prefill_tokens { isl } else { 0 };
-        let prefill_token = request
-            .prefill_tokens
-            .get(&worker)
-            .copied()
-            .unwrap_or(default_prefill_token);
-        let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
-        let decode_block = request
-            .decode_blocks
-            .get(&worker)
-            .copied()
-            .unwrap_or(potential_prefill_block.floor() as usize) as f64;
-        let logit = overlap_weight * potential_prefill_block + decode_block;
 
-        tracing::debug!(
-            "{formula_name} for worker_id={} dp_rank={:?} with {overlap_blocks} cached blocks: {logit:.3} \
-             = {overlap_weight:.1} * prefill_blocks + decode_blocks \
-             = {overlap_weight:.1} * {potential_prefill_block:.3} + {decode_block:.3}",
-            worker.worker_id,
-            worker.dp_rank
-        );
+        let logit = match self.worker_selection_formula {
+            WorkerSelectionFormula::OverlapLoad => {
+                let default_prefill_token = if request.track_prefill_tokens { isl } else { 0 };
+                let prefill_token = request
+                    .prefill_tokens
+                    .get(&worker)
+                    .copied()
+                    .unwrap_or(default_prefill_token);
+                let potential_prefill_block = (prefill_token as f64) / (block_size as f64);
+                let decode_block = request
+                    .decode_blocks
+                    .get(&worker)
+                    .copied()
+                    .unwrap_or(potential_prefill_block.floor() as usize)
+                    as f64;
+                let logit = overlap_weight * potential_prefill_block + decode_block;
+
+                tracing::debug!(
+                    "{formula_name} for worker_id={} dp_rank={:?} with {overlap_blocks} cached blocks: {logit:.3} \
+                     = {overlap_weight:.1} * prefill_blocks + decode_blocks \
+                     = {overlap_weight:.1} * {potential_prefill_block:.3} + {decode_block:.3}",
+                    worker.worker_id,
+                    worker.dp_rank
+                );
+
+                logit
+            }
+            WorkerSelectionFormula::Lmetric => {
+                let hit_tokens = (overlap_blocks as usize).saturating_mul(block_size as usize);
+                let new_tokens = isl.saturating_sub(hit_tokens);
+                let batch_size = request.batch_sizes.get(&worker).copied().unwrap_or(1);
+                let logit = (new_tokens as f64) * (batch_size as f64);
+
+                tracing::debug!(
+                    "LMETRIC for worker_id={} dp_rank={:?} with {overlap_blocks} cached blocks: {logit:.3} \
+                     = new_tokens * batch_size = {new_tokens} * {batch_size}",
+                    worker.worker_id,
+                    worker.dp_rank
+                );
+
+                logit
+            }
+        };
 
         WorkerScore {
             overlap_blocks,
@@ -241,6 +285,10 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 }
             }
 
+            if min_workers.is_empty() {
+                return Err(KvSchedulerError::NoEndpoints);
+            }
+
             if min_workers.len() > 1 {
                 tracing::debug!(
                     "Multiple workers tied with same logit, using tree size as tie-breaker"
@@ -322,6 +370,115 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::SimpleWorkerConfig;
+
+    fn lmetric_request(
+        isl_tokens: usize,
+        overlaps: &[(WorkerWithDpRank, u32)],
+        batch_sizes: &[(WorkerWithDpRank, usize)],
+    ) -> SchedulingRequest {
+        SchedulingRequest {
+            maybe_request_id: None,
+            token_seq: None,
+            isl_tokens,
+            overlaps: crate::protocols::OverlapScores {
+                scores: FxHashMap::from_iter(overlaps.iter().copied()),
+                frequencies: Vec::new(),
+                tree_sizes: FxHashMap::default(),
+            },
+            decode_blocks: FxHashMap::default(),
+            prefill_tokens: FxHashMap::default(),
+            batch_sizes: FxHashMap::from_iter(batch_sizes.iter().copied()),
+            track_prefill_tokens: true,
+            router_config_override: None,
+            update_states: false,
+            lora_name: None,
+            priority_jump: 0.0,
+            expected_output_tokens: None,
+            pinned_worker: None,
+            allowed_worker_ids: None,
+            resp_tx: None,
+        }
+    }
+
+    fn two_workers() -> HashMap<WorkerId, SimpleWorkerConfig> {
+        HashMap::from([
+            (1, SimpleWorkerConfig::default()),
+            (2, SimpleWorkerConfig::default()),
+        ])
+    }
+
+    #[test]
+    fn lmetric_prefers_smaller_batch_size_when_overlap_matches() {
+        let worker_a = WorkerWithDpRank::from_worker_id(1);
+        let worker_b = WorkerWithDpRank::from_worker_id(2);
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let request = lmetric_request(100, &[(worker_a, 0), (worker_b, 0)], &[(worker_a, 3)]);
+
+        let selection = selector.select_worker(&two_workers(), &request, 10).unwrap();
+
+        assert_eq!(selection.worker, worker_b);
+    }
+
+    #[test]
+    fn lmetric_prefers_higher_overlap_when_batch_size_matches() {
+        let worker_a = WorkerWithDpRank::from_worker_id(1);
+        let worker_b = WorkerWithDpRank::from_worker_id(2);
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let request = lmetric_request(
+            100,
+            &[(worker_a, 2), (worker_b, 5)],
+            &[(worker_a, 1), (worker_b, 1)],
+        );
+
+        let selection = selector.select_worker(&two_workers(), &request, 10).unwrap();
+
+        assert_eq!(selection.worker, worker_b);
+    }
+
+    #[test]
+    fn lmetric_uses_new_tokens_times_batch_size() {
+        let worker_a = WorkerWithDpRank::from_worker_id(1);
+        let worker_b = WorkerWithDpRank::from_worker_id(2);
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let request = lmetric_request(
+            200,
+            &[(worker_a, 10), (worker_b, 5)],
+            &[(worker_a, 2), (worker_b, 1)],
+        );
+
+        let selection = selector.select_worker(&two_workers(), &request, 10).unwrap();
+
+        assert_eq!(selection.worker, worker_b);
+    }
+
+    #[test]
+    fn lmetric_defaults_missing_batch_size_to_one() {
+        let worker_a = WorkerWithDpRank::from_worker_id(1);
+        let worker_b = WorkerWithDpRank::from_worker_id(2);
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let request = lmetric_request(100, &[(worker_a, 0), (worker_b, 1)], &[(worker_a, 5)]);
+
+        let selection = selector.select_worker(&two_workers(), &request, 10).unwrap();
+
+        assert_eq!(selection.worker, worker_b);
+    }
 
     #[test]
     fn test_softmax_sample_single_key() {

@@ -48,7 +48,7 @@ class FrontendRouterProcess(ManagedProcess):
             namespace,
         ]
 
-        if router_mode == "kv":
+        if router_mode in ("kv", "lmetric"):
             command.extend(["--kv-cache-block-size", str(block_size)])
 
         if enforce_disagg:

@@ -160,6 +160,7 @@ pub enum RouterMode {
     Random,
     PowerOfTwoChoices,
     KV,
+    Lmetric,
     Direct,
     LeastLoaded,
     /// Device-aware weighted routing for heterogeneous workers.
@@ -168,7 +169,7 @@ pub enum RouterMode {
 
 impl RouterMode {
     pub fn is_kv_routing(&self) -> bool {
-        *self == RouterMode::KV
+        matches!(self, RouterMode::KV | RouterMode::Lmetric)
     }
 
     pub fn is_direct_routing(&self) -> bool {
@@ -585,7 +586,7 @@ where
             | RouterMode::Direct
             | RouterMode::LeastLoaded
             | RouterMode::DeviceAwareWeighted => None,
-            RouterMode::KV => {
+            RouterMode::KV | RouterMode::Lmetric => {
                 panic!(
                     "select_next_worker should not be called for {:?} routing mode",
                     self.router_mode
@@ -620,7 +621,7 @@ where
             | RouterMode::Direct
             | RouterMode::LeastLoaded
             | RouterMode::DeviceAwareWeighted => None,
-            RouterMode::KV => {
+            RouterMode::KV | RouterMode::Lmetric => {
                 panic!(
                     "peek_next_worker should not be called for {:?} routing mode",
                     self.router_mode
@@ -655,7 +656,7 @@ where
     ) -> anyhow::Result<ManyOut<U>> {
         let route_start = Instant::now();
         let request_id = request.id().to_string();
-        let route_span = if matches!(self.router_mode, RouterMode::KV) {
+        let route_span = if self.router_mode.is_kv_routing() {
             tracing::Span::none()
         } else {
             tracing::info_span!(
@@ -862,7 +863,7 @@ where
             RouterMode::Random => self.random(request).await,
             RouterMode::RoundRobin => self.round_robin(request).await,
             RouterMode::PowerOfTwoChoices => self.power_of_two_choices(request).await,
-            RouterMode::KV => {
+            RouterMode::KV | RouterMode::Lmetric => {
                 anyhow::bail!("KV routing should not call generate on PushRouter");
             }
             RouterMode::Direct => {
@@ -943,6 +944,14 @@ mod tests {
         fn err(&self) -> Option<DynamoError> {
             self.error.clone()
         }
+    }
+
+    #[test]
+    fn lmetric_is_kv_routing() {
+        assert!(RouterMode::KV.is_kv_routing());
+        assert!(RouterMode::Lmetric.is_kv_routing());
+        assert!(!RouterMode::RoundRobin.is_kv_routing());
+        assert!(!RouterMode::LeastLoaded.is_kv_routing());
     }
 
     #[test]

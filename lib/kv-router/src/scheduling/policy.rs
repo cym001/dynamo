@@ -131,6 +131,7 @@ mod tests {
             overlaps,
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            batch_sizes: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: false,

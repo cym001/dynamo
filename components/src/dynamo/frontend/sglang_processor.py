@@ -583,7 +583,7 @@ class SglangEngineFactory:
             f"{namespace_name}.{component_name}.{endpoint_name}"
         )
         router: Client | KvRouter
-        if self.router_config.router_mode == RouterMode.KV:
+        if self.router_config.router_mode in (RouterMode.KV, RouterMode.Lmetric):
             router = KvRouter(
                 endpoint=generate_endpoint,
                 block_size=self.config.kv_cache_block_size or 16,

@@ -82,6 +82,14 @@ impl RequestIndex {
         request_ids
     }
 
+    pub(super) fn active_request_counts(&self) -> HashMap<WorkerWithDpRank, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.request_to_worker.iter() {
+            *counts.entry(*entry.value()).or_insert(0) += 1;
+        }
+        counts
+    }
+
     pub(super) fn active_lora_counts(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
         for entry in self.request_to_lora.iter() {
@@ -157,21 +165,27 @@ mod tests {
     }
 
     #[test]
-    fn remove_worker_requests_clears_both_maps() {
+    fn active_request_counts_tracks_set_and_remove() {
         let index = RequestIndex::default();
         let worker_a = WorkerWithDpRank::new(1, 0);
         let worker_b = WorkerWithDpRank::new(2, 0);
-        index.set_request("req-a".to_string(), worker_a, Some("adapter-a".to_string()));
-        index.set_request("req-b".to_string(), worker_b, Some("adapter-b".to_string()));
-        index.set_request("req-c".to_string(), worker_a, None);
 
-        let mut removed = index.remove_worker_requests(worker_a);
-        removed.sort();
-        assert_eq!(removed, vec!["req-a".to_string(), "req-c".to_string()]);
-        assert_eq!(index.worker_for(&"req-b".to_string()), Some(worker_b));
+        index.set_request("req-a".to_string(), worker_a, None);
+        index.set_request("req-b".to_string(), worker_a, None);
+        index.set_request("req-c".to_string(), worker_b, None);
+
         assert_eq!(
-            index.active_lora_counts(),
-            HashMap::from([("adapter-b".to_string(), 1)])
+            index.active_request_counts(),
+            HashMap::from([(worker_a, 2), (worker_b, 1)])
         );
+
+        index.remove_request(&"req-a".to_string());
+        assert_eq!(
+            index.active_request_counts(),
+            HashMap::from([(worker_a, 1), (worker_b, 1)])
+        );
+
+        index.remove_worker_requests(worker_a);
+        assert_eq!(index.active_request_counts(), HashMap::from([(worker_b, 1)]));
     }
 }

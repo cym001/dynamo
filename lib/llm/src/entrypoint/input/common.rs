@@ -311,9 +311,9 @@ where
     let min_initial_workers = min_initial_workers_from_env()?;
 
     // For KV routing, use the client from the chooser to ensure shared state
-    let router_client = if router_mode == RouterMode::KV {
+    let router_client = if router_mode.is_kv_routing() {
         let Some(ref chooser) = chooser else {
-            anyhow::bail!("RouterMode::KV requires KVRouter to not be null");
+            anyhow::bail!("KV routing requires KVRouter to not be null");
         };
         chooser.client().clone()
     } else {
@@ -348,9 +348,9 @@ where
         | RouterMode::PowerOfTwoChoices
         | RouterMode::LeastLoaded
         | RouterMode::DeviceAwareWeighted => ServiceBackend::from_engine(Arc::new(router)),
-        RouterMode::KV => {
+        RouterMode::KV | RouterMode::Lmetric => {
             let Some(chooser) = chooser else {
-                anyhow::bail!("RouterMode::KV requires KVRouter to not be null");
+                anyhow::bail!("KV routing requires KVRouter to not be null");
             };
             ServiceBackend::from_engine(Arc::new(KvPushRouter::new(router, chooser)))
         }

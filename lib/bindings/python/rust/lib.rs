@@ -48,6 +48,7 @@ pub enum RouterMode {
     Random,
     PowerOfTwoChoices,
     KV,
+    Lmetric,
     /// Direct routing - reads worker ID from each request's routing hints.
     /// Used when an external orchestrator (e.g., EPP) handles worker selection.
     Direct,
@@ -62,6 +63,7 @@ impl From<RouterMode> for RsRouterMode {
             RouterMode::Random => Self::Random,
             RouterMode::PowerOfTwoChoices => Self::PowerOfTwoChoices,
             RouterMode::KV => Self::KV,
+            RouterMode::Lmetric => Self::Lmetric,
             RouterMode::Direct => Self::Direct,
             RouterMode::LeastLoaded => Self::LeastLoaded,
             RouterMode::DeviceAwareWeighted => Self::DeviceAwareWeighted,

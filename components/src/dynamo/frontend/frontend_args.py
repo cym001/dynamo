@@ -126,9 +126,9 @@ class FrontendConfig(KvRouterConfigBase, AicPerfConfigBase):
                 f"(choose from {sorted(self._VALID_TOKENIZER_BACKENDS)})"
             )
         if self.router_prefill_load_model == "aic":
-            if self.router_mode != "kv":
+            if self.router_mode not in {"kv", "lmetric"}:
                 raise ValueError(
-                    "--router-prefill-load-model=aic requires --router-mode=kv"
+                    "--router-prefill-load-model=aic requires --router-mode=kv or lmetric"
                 )
             if self.chat_processor != "dynamo":
                 raise ValueError(
@@ -153,9 +153,11 @@ class FrontendConfig(KvRouterConfigBase, AicPerfConfigBase):
                     "--router-prefill-load-model=aic requires "
                     "--router-track-prefill-tokens"
                 )
+        if self.router_mode == "lmetric" and not self.router_track_active_blocks:
+            raise ValueError("--router-mode=lmetric requires --router-track-active-blocks")
         if self.serve_indexer:
-            if self.router_mode != "kv":
-                raise ValueError("--serve-indexer requires --router-mode=kv")
+            if self.router_mode not in {"kv", "lmetric"}:
+                raise ValueError("--serve-indexer requires --router-mode=kv or lmetric")
             if self.use_remote_indexer:
                 raise ValueError(
                     "--serve-indexer and --use-remote-indexer are mutually exclusive"
@@ -254,7 +256,9 @@ class FrontendArgGroup(ArgGroup):
             env_var="DYN_ROUTER_MODE",
             default="round-robin",
             help="How to route the request. power-of-two picks 2 random workers and "
-            "routes to the one with fewer in-flight requests. least-loaded routes to "
+            "routes to the one with fewer in-flight requests. lmetric reuses KV "
+            "routing and selects the worker minimizing new_tokens * active_request_count. "
+            "least-loaded routes to "
             "the worker with the fewest active requests. device-aware-weighted routes "
             "based on worker device type (CPU/CUDA). In disaggregated prefill mode, "
             "both power-of-two and least-loaded skip bootstrap optimization and fall "
@@ -264,6 +268,7 @@ class FrontendArgGroup(ArgGroup):
                 "random",
                 "power-of-two",
                 "kv",
+                "lmetric",
                 "direct",
                 "least-loaded",
                 "device-aware-weighted",

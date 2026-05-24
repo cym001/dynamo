@@ -245,6 +245,12 @@ impl<
             );
         request.decode_blocks = decode_blocks;
         request.prefill_tokens = prefill_tokens;
+        request.batch_sizes = self
+            .slots
+            .active_request_counts()
+            .into_iter()
+            .map(|(worker, count)| (worker, count + 1))
+            .collect();
 
         let selection = {
             let workers = self.workers_with_configs.borrow();
@@ -409,11 +415,11 @@ mod tests {
     use tokio::sync::{Barrier, watch};
 
     use super::*;
-    use crate::protocols::{OverlapScores, WorkerSelectionResult, WorkerWithDpRank};
+    use crate::protocols::{OverlapScores, PrefillLoadHint, WorkerSelectionResult, WorkerWithDpRank};
     use crate::scheduling::types::KvSchedulerError;
     use crate::sequences::ActiveSequencesMultiWorker;
     use crate::test_utils::{NoopSequencePublisher, SimpleWorkerConfig};
-    use crate::{DefaultWorkerSelector, WorkerSelector};
+    use crate::{DefaultWorkerSelector, WorkerSelectionFormula, WorkerSelector};
 
     fn decay_now() -> Instant {
         Instant::now()
@@ -632,6 +638,7 @@ mod tests {
             overlaps: OverlapScores::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            batch_sizes: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,
@@ -721,6 +728,86 @@ mod tests {
         );
 
         for request_id in ["req-1", "req-2"] {
+            slots
+                .mark_prefill_completed(&request_id.to_string(), decay_now())
+                .unwrap();
+            slots.free(&request_id.to_string(), decay_now()).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lmetric_admissions_see_active_request_counts() {
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let (queue, slots) = make_queue_with_custom_selector(2, 16, 512, None, selector);
+
+        let (req1, rx1) = make_request("lmetric-1", 512);
+        queue.enqueue(req1).await;
+        let resp1 = rx1.await.unwrap().unwrap();
+
+        let (req2, rx2) = make_request("lmetric-2", 512);
+        queue.enqueue(req2).await;
+        let resp2 = rx2.await.unwrap().unwrap();
+
+        assert_ne!(
+            resp1.best_worker, resp2.best_worker,
+            "second LMETRIC admission should see first active request and prefer another idle worker"
+        );
+
+        for request_id in ["lmetric-1", "lmetric-2"] {
+            slots
+                .mark_prefill_completed(&request_id.to_string(), decay_now())
+                .unwrap();
+            slots.free(&request_id.to_string(), decay_now()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lmetric_can_prefer_lower_score_over_idle_worker() {
+        let selector = DefaultWorkerSelector::new_with_formula(
+            None,
+            "test",
+            WorkerSelectionFormula::Lmetric,
+        );
+        let (queue, slots) = make_queue_with_custom_selector(2, 16, 512, None, selector);
+        let worker_0 = WorkerWithDpRank::from_worker_id(0);
+        let worker_1 = WorkerWithDpRank::from_worker_id(1);
+
+        slots
+            .add_request(
+                SequenceRequest {
+                    request_id: "existing".to_string(),
+                    token_sequence: None,
+                    isl: 512,
+                    overlap: 0,
+                    track_prefill_tokens: true,
+                    expected_output_tokens: None,
+                    prefill_load_hint: Some(PrefillLoadHint {
+                        initial_effective_prefill_tokens: 512,
+                        expected_prefill_duration: None,
+                    }),
+                    worker: worker_0,
+                    lora_name: None,
+                },
+                decay_now(),
+            )
+            .unwrap();
+
+        let (mut req, rx) = make_request("lmetric-new", 512);
+        req.overlaps = OverlapScores {
+            scores: FxHashMap::from_iter([(worker_0, 31), (worker_1, 0)]),
+            frequencies: Vec::new(),
+            tree_sizes: FxHashMap::default(),
+        };
+        queue.enqueue(req).await;
+
+        let response = rx.await.unwrap().unwrap();
+        assert_eq!(response.best_worker, worker_0);
+
+        for request_id in ["existing", "lmetric-new"] {
             slots
                 .mark_prefill_completed(&request_id.to_string(), decay_now())
                 .unwrap();
@@ -1023,6 +1110,7 @@ mod tests {
             overlaps: OverlapScores::default(),
             decode_blocks: FxHashMap::default(),
             prefill_tokens: FxHashMap::default(),
+            batch_sizes: FxHashMap::default(),
             track_prefill_tokens: true,
             router_config_override: None,
             update_states: true,

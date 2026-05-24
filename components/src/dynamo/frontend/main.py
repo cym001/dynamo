@@ -218,8 +218,8 @@ async def async_main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, signal_handler)
 
-    if config.router_mode == "kv":
-        router_mode = RouterMode.KV
+    if config.router_mode in ("kv", "lmetric"):
+        router_mode = RouterMode.KV if config.router_mode == "kv" else RouterMode.Lmetric
         kv_router_config = KvRouterConfig(**config.kv_router_kwargs())
     elif config.router_mode == "random":
         router_mode = RouterMode.Random

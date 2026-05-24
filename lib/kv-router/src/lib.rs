@@ -55,4 +55,4 @@ pub use scheduling::LocalScheduler;
 pub use scheduling::PrefillLoadEstimator;
 pub use scheduling::policy::{FcfsPolicy, RouterSchedulingPolicy, SchedulingPolicy, WsptPolicy};
 pub use scheduling::{KvSchedulerError, PotentialLoad, SchedulingRequest, SchedulingResponse};
-pub use selector::{DefaultWorkerSelector, WorkerSelector};
+pub use selector::{DefaultWorkerSelector, WorkerSelectionFormula, WorkerSelector};

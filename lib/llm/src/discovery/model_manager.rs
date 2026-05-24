@@ -4,7 +4,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use dashmap::{DashMap, mapref::entry::Entry};
-use dynamo_kv_router::{PrefillLoadEstimator, config::KvRouterConfig, protocols::WorkerId};
+use dynamo_kv_router::{
+    PrefillLoadEstimator, WorkerSelectionFormula, config::KvRouterConfig, protocols::WorkerId,
+};
 use tokio::sync::oneshot;
 
 use super::worker_monitor::LoadThresholdConfig;
@@ -573,6 +575,7 @@ impl ModelManager {
         kv_router_config: Option<KvRouterConfig>,
         prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
         worker_type: &'static str,
+        worker_selection_formula: WorkerSelectionFormula,
         model_name: Option<String>,
         is_eagle: bool,
     ) -> anyhow::Result<Arc<KvRouter>> {
@@ -601,7 +604,11 @@ impl ModelManager {
         // Get of create runtime config watcher for this endpoint
         let workers_with_configs = self.get_or_create_runtime_config_watcher(endpoint).await?;
 
-        let selector = DefaultWorkerSelector::new(kv_router_config.clone(), worker_type);
+        let selector = DefaultWorkerSelector::new_with_formula(
+            kv_router_config.clone(),
+            worker_type,
+            worker_selection_formula,
+        );
         let chooser = KvRouter::new(
             endpoint.clone(),
             client,
