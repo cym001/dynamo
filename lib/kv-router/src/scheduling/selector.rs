@@ -160,10 +160,15 @@ fn kv_aware_running(active_requests: usize) -> usize {
     active_requests + 1
 }
 
-fn kv_aware_score(request_blocks: usize, overlap_blocks: u32, active_requests: usize) -> f64 {
+fn kv_aware_score(
+    request_blocks: usize,
+    overlap_blocks: u32,
+    active_requests: usize,
+    overlap_weight: f64,
+) -> f64 {
     let miss_blocks = request_blocks.saturating_sub(overlap_blocks as usize);
     let running = kv_aware_running(active_requests);
-    (miss_blocks + running) as f64
+    (miss_blocks as f64) * overlap_weight + running as f64
 }
 
 fn break_tied_workers_by_tree_size(
@@ -356,7 +361,8 @@ impl DefaultWorkerSelector {
             }
             WorkerSelectionFormula::KvAware => {
                 let request_blocks = isl.div_ceil(block_size as usize);
-                let score = kv_aware_score(request_blocks, overlap_blocks, active_requests);
+                let score =
+                    kv_aware_score(request_blocks, overlap_blocks, active_requests, overlap_weight);
                 let miss_blocks = request_blocks.saturating_sub(overlap_blocks as usize);
                 let running = kv_aware_running(active_requests);
                 tracing::debug!(
@@ -365,10 +371,11 @@ impl DefaultWorkerSelector {
                     formula = formula.as_str(),
                     overlap_blocks,
                     miss_blocks,
+                    overlap_weight,
                     active_requests,
                     running,
                     logit = score,
-                    "Worker selection score: kv-aware = miss_blocks + running"
+                    "Worker selection score: kv-aware = miss_blocks * overlap_weight + running"
                 );
                 score
             }
@@ -594,8 +601,8 @@ mod tests {
 
     #[test]
     fn test_kv_aware_score() {
-        assert_eq!(kv_aware_score(10, 8, 2), 5.0);
-        assert_eq!(kv_aware_score(10, 5, 0), 6.0);
+        assert_eq!(kv_aware_score(10, 8, 2, 1.0), 5.0);
+        assert_eq!(kv_aware_score(10, 5, 0, 1.0), 6.0);
         assert_eq!(kv_aware_running(2), 3);
     }
 
